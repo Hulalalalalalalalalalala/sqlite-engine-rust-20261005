@@ -11,7 +11,10 @@
 //! the last call to [`step`](Backup::step), and
 //! [`run_to_completion`](Backup::run_to_completion) will attempt to back up the
 //! entire source database, allowing you to specify how many pages are backed up
-//! at a time and how long the thread should sleep between chunks of pages.
+//! at a time and how long the thread should sleep between chunks of pages, and
+//! [`run_to_completion_with_callback`](Backup::run_to_completion_with_callback)
+//! does the same while letting a closure observe every step, abort the run, and
+//! bound the number of consecutive lock conflicts.
 //!
 //! The following example is equivalent to "Example 2: Online Backup of a
 //! Running Database" from [SQLite's Online Backup API
@@ -44,7 +47,7 @@ use std::time::Duration;
 use crate::ffi;
 
 use crate::error::error_from_handle;
-use crate::{Connection, MAIN_DB, Name, Result};
+use crate::{Connection, Error, MAIN_DB, Name, Result};
 
 impl Connection {
     /// Back up the `name` database to the given
@@ -171,6 +174,36 @@ pub struct Progress {
     pub remaining: c_int,
     /// Total number of pages in the source database.
     pub pagecount: c_int,
+}
+
+/// Instruction returned by the callback of
+/// [`run_to_completion_with_callback`](Backup::run_to_completion_with_callback)
+/// to control the automatic backup loop.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackupControl {
+    /// Continue with the next step, sleeping for the configured pause first.
+    Continue,
+
+    /// Stop the automatic run immediately: no further pages are copied and no
+    /// further sleeping happens. The [`Backup`] handle stays usable.
+    Abort,
+}
+
+/// The outcome of
+/// [`run_to_completion_with_callback`](Backup::run_to_completion_with_callback).
+/// Database errors are reported through the enclosing [`Result`]'s `Err`
+/// variant instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackupRunOutcome {
+    /// The backup ran to completion.
+    Done,
+
+    /// The callback asked to stop before the backup was complete. Only this
+    /// automatic run is ended - the [`Backup`] handle can still be stepped
+    /// manually or driven to completion by another call.
+    Aborted,
 }
 
 /// A handle to an online backup.
@@ -312,6 +345,106 @@ impl Backup<'_, '_> {
             }
         }
     }
+
+    /// Attempts to run the entire backup, like
+    /// [`run_to_completion`](Backup::run_to_completion), but with a callback
+    /// that can observe every step and stop the run, and with an upper bound
+    /// on consecutive lock conflicts.
+    ///
+    /// Calls [`step(pages_per_step)`](Backup::step) repeatedly, sleeping for
+    /// `pause_between_pages` (which may be zero) between attempts. After every
+    /// attempt that returns [`StepResult::More`], [`StepResult::Busy`],
+    /// [`StepResult::Locked`] or [`StepResult::Done`], `callback` is invoked
+    /// exactly once with that result and the progress as of this attempt, and
+    /// its return value decides whether the run continues. The callback may
+    /// borrow and mutate local state (`FnMut`).
+    ///
+    /// If the callback returns [`BackupControl::Abort`], the run stops
+    /// immediately - without sleeping or copying further pages - and
+    /// [`BackupRunOutcome::Aborted`] is returned, unless the attempt just made
+    /// returned [`StepResult::Done`], in which case the backup is already
+    /// complete and [`BackupRunOutcome::Done`] is returned.
+    ///
+    /// [`StepResult::Busy`] and [`StepResult::Locked`] share a single
+    /// consecutive-conflict counter: the first conflict counts as one, and a
+    /// [`StepResult::More`] attempt resets the counter to zero. When the
+    /// counter reaches `max_consecutive_lock_conflicts`, the callback is still
+    /// notified of that attempt; if it asks to continue, the `Busy`/`Locked`
+    /// SQLite error of this attempt is returned instead of making another
+    /// attempt. The counter is reset on every call of this method. This limit
+    /// only bounds the attempts of this run - it does not change the busy
+    /// timeout or any other setting of the underlying connections.
+    ///
+    /// Aborting or hitting the conflict limit only ends this automatic run:
+    /// the [`Backup`] handle remains usable for manual
+    /// [`step`](Backup::step) calls or another automatic run.
+    ///
+    /// Note that the reported progress faithfully reflects SQLite's own page
+    /// counts: if another connection modifies the source database between
+    /// steps, `remaining`/`pagecount` may grow again, and the run is not
+    /// considered complete until [`step`](Backup::step) itself reports
+    /// [`StepResult::Done`].
+    ///
+    /// # Failure
+    ///
+    /// Will return `Err` - without copying any pages or invoking `callback` -
+    /// if `pages_per_step` or `max_consecutive_lock_conflicts` is not
+    /// positive. Will also return `Err` if any of the calls to
+    /// [`step`](Backup::step) return `Err`; such errors are returned as-is,
+    /// without notifying `callback` or retrying.
+    pub fn run_to_completion_with_callback<F>(
+        &self,
+        pages_per_step: c_int,
+        pause_between_pages: Duration,
+        max_consecutive_lock_conflicts: c_int,
+        mut callback: F,
+    ) -> Result<BackupRunOutcome>
+    where
+        F: FnMut(StepResult, Progress) -> BackupControl,
+    {
+        use self::StepResult::{Busy, Done, Locked, More};
+
+        if pages_per_step <= 0 {
+            return Err(Error::InvalidParameter(format!(
+                "pages_per_step must be positive, got {pages_per_step}"
+            )));
+        }
+        if max_consecutive_lock_conflicts <= 0 {
+            return Err(Error::InvalidParameter(format!(
+                "max_consecutive_lock_conflicts must be positive, got {max_consecutive_lock_conflicts}"
+            )));
+        }
+
+        let mut consecutive_lock_conflicts = 0;
+        loop {
+            let r = self.step(pages_per_step)?;
+            let control = callback(r, self.progress());
+            match r {
+                Done => return Ok(BackupRunOutcome::Done),
+                More => {
+                    consecutive_lock_conflicts = 0;
+                    if control == BackupControl::Abort {
+                        return Ok(BackupRunOutcome::Aborted);
+                    }
+                }
+                Busy | Locked => {
+                    consecutive_lock_conflicts += 1;
+                    if control == BackupControl::Abort {
+                        return Ok(BackupRunOutcome::Aborted);
+                    }
+                    if consecutive_lock_conflicts >= max_consecutive_lock_conflicts {
+                        let code = if r == Busy {
+                            ffi::SQLITE_BUSY
+                        } else {
+                            ffi::SQLITE_LOCKED
+                        };
+                        return Err(unsafe { error_from_handle(ptr::null_mut(), code) });
+                    }
+                }
+            }
+            thread::sleep(pause_between_pages);
+        }
+    }
 }
 
 impl Drop for Backup<'_, '_> {
@@ -326,8 +459,8 @@ mod test {
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
-    use super::{Backup, NO_PROGRESS, Progress};
-    use crate::{Connection, MAIN_DB, Result, TEMP_DB};
+    use super::{Backup, BackupControl, BackupRunOutcome, NO_PROGRESS, Progress, StepResult};
+    use crate::{Connection, Error, ErrorCode, MAIN_DB, Result, TEMP_DB};
     use std::time::Duration;
 
     #[cfg_attr(
@@ -442,6 +575,255 @@ mod test {
 
         let the_answer: i64 = dst.one_column("SELECT SUM(x) FROM foo", [])?;
         assert_eq!(42 + 43, the_answer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_to_completion_with_callback_done() -> Result<()> {
+        let src = Connection::open_in_memory()?;
+        src.execute_batch(
+            "BEGIN;
+             CREATE TABLE foo(x INTEGER);
+             INSERT INTO foo VALUES(42);
+             END;",
+        )?;
+
+        let mut dst = Connection::open_in_memory()?;
+
+        {
+            let backup = Backup::new(&src, &mut dst)?;
+            let mut results = Vec::new();
+            let outcome = backup.run_to_completion_with_callback(
+                1,
+                Duration::ZERO,
+                3,
+                |result, progress| {
+                    results.push((result, progress.remaining, progress.pagecount));
+                    BackupControl::Continue
+                },
+            )?;
+            assert_eq!(BackupRunOutcome::Done, outcome);
+            // every attempt notified the callback exactly once, ending with Done
+            assert_eq!(Some(&StepResult::Done), results.last().map(|r| &r.0));
+            assert!(results[..results.len() - 1]
+                .iter()
+                .all(|r| r.0 == StepResult::More));
+            // the final notification reports no remaining pages
+            assert_eq!(0, results.last().unwrap().1);
+        }
+
+        assert_eq!(42, dst.one_column::<i64, _>("SELECT x FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_to_completion_with_callback_abort_and_resume() -> Result<()> {
+        let src = Connection::open_in_memory()?;
+        src.execute_batch(
+            "BEGIN;
+             CREATE TABLE foo(x INTEGER);
+             INSERT INTO foo VALUES(42);
+             END;",
+        )?;
+
+        let mut dst = Connection::open_in_memory()?;
+
+        {
+            let backup = Backup::new(&src, &mut dst)?;
+
+            // abort on the very first notification
+            let mut calls = 0;
+            let outcome = backup.run_to_completion_with_callback(
+                1,
+                Duration::from_millis(1),
+                3,
+                |_, _| {
+                    calls += 1;
+                    BackupControl::Abort
+                },
+            )?;
+            assert_eq!(BackupRunOutcome::Aborted, outcome);
+            assert_eq!(1, calls);
+
+            // the same handle can be driven to completion afterwards
+            let outcome =
+                backup.run_to_completion_with_callback(5, Duration::ZERO, 3, |_, _| {
+                    BackupControl::Continue
+                })?;
+            assert_eq!(BackupRunOutcome::Done, outcome);
+        }
+
+        assert_eq!(42, dst.one_column::<i64, _>("SELECT x FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_to_completion_with_callback_done_beats_abort() -> Result<()> {
+        let src = Connection::open_in_memory()?;
+        src.execute_batch("CREATE TABLE foo AS SELECT 42 AS x")?;
+
+        let mut dst = Connection::open_in_memory()?;
+
+        {
+            let backup = Backup::new(&src, &mut dst)?;
+            // the whole database fits in a single step, so the first (and
+            // only) attempt returns Done; aborting cannot undo that
+            let outcome = backup.run_to_completion_with_callback(
+                1000,
+                Duration::ZERO,
+                3,
+                |result, _| {
+                    assert_eq!(StepResult::Done, result);
+                    BackupControl::Abort
+                },
+            )?;
+            assert_eq!(BackupRunOutcome::Done, outcome);
+        }
+
+        assert_eq!(42, dst.one_column::<i64, _>("SELECT x FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_to_completion_with_callback_invalid_params() -> Result<()> {
+        let src = Connection::open_in_memory()?;
+        src.execute_batch("CREATE TABLE foo AS SELECT 42 AS x")?;
+
+        let mut dst = Connection::open_in_memory()?;
+
+        {
+            let backup = Backup::new(&src, &mut dst)?;
+            for (pages, limit) in [(0, 3), (-1, 3), (5, 0), (5, -2)] {
+                let mut calls = 0;
+                let err = backup
+                    .run_to_completion_with_callback(
+                        pages,
+                        Duration::ZERO,
+                        limit,
+                        |_, _| {
+                            calls += 1;
+                            BackupControl::Continue
+                        },
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::InvalidParameter(_)),
+                    "expected InvalidParameter, got {err:?}"
+                );
+                assert_eq!(0, calls, "callback must not run on invalid parameters");
+            }
+        }
+
+        // nothing was copied
+        assert!(dst.one_column::<i64, _>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'foo'",
+            [],
+        ).is_ok_and(|n| n == 0));
+        Ok(())
+    }
+
+    #[cfg_attr(
+        all(target_family = "wasm", target_os = "unknown"),
+        ignore = "no filesystem on this platform"
+    )]
+    #[test]
+    fn test_run_to_completion_with_callback_busy_limit() -> Result<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_path = temp_dir.path().join("src.db3");
+        let dst_path = temp_dir.path().join("dst.db3");
+
+        let src = Connection::open(&src_path)?;
+        src.execute_batch("CREATE TABLE foo AS SELECT 42 AS x")?;
+
+        let mut dst = Connection::open(&dst_path)?;
+
+        // hold a write lock on the destination from another connection so
+        // every backup attempt fails with Busy
+        let blocker = Connection::open(&dst_path)?;
+        blocker.execute_batch("BEGIN EXCLUSIVE; CREATE TABLE held(y);")?;
+
+        {
+            let backup = Backup::new(&src, &mut dst)?;
+
+            // limit of 3: the third consecutive Busy is reported to the
+            // callback, then returned as an error without a fourth attempt
+            let mut calls = 0;
+            let err = backup
+                .run_to_completion_with_callback(5, Duration::ZERO, 3, |result, _| {
+                    calls += 1;
+                    assert_eq!(StepResult::Busy, result);
+                    BackupControl::Continue
+                })
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::SqliteFailure(ref e, _) if e.code == ErrorCode::DatabaseBusy
+                ),
+                "expected SQLITE_BUSY, got {err:?}"
+            );
+            assert_eq!(3, calls);
+
+            // aborting on a conflict reports Aborted instead of the error
+            let outcome =
+                backup.run_to_completion_with_callback(5, Duration::ZERO, 3, |result, _| {
+                    assert_eq!(StepResult::Busy, result);
+                    BackupControl::Abort
+                })?;
+            assert_eq!(BackupRunOutcome::Aborted, outcome);
+
+            // once the lock is gone the same handle completes; the conflict
+            // counter restarts with each call
+            blocker.execute_batch("ROLLBACK;")?;
+            let outcome =
+                backup.run_to_completion_with_callback(5, Duration::ZERO, 3, |_, _| {
+                    BackupControl::Continue
+                })?;
+            assert_eq!(BackupRunOutcome::Done, outcome);
+        }
+
+        // the destination connection is usable again once the backup is dropped
+        assert_eq!(42, dst.one_column::<i64, _>("SELECT x FROM foo", [])?);
+        dst.execute_batch("INSERT INTO foo VALUES(43)")?;
+        Ok(())
+    }
+
+    #[cfg_attr(
+        all(target_family = "wasm", target_os = "unknown"),
+        ignore = "no filesystem on this platform"
+    )]
+    #[test]
+    fn test_run_to_completion_with_callback_aborted_backup_untouched() -> Result<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_path = temp_dir.path().join("src.db3");
+        let dst_path = temp_dir.path().join("dst.db3");
+
+        let src = Connection::open(&src_path)?;
+        src.execute_batch("CREATE TABLE foo AS SELECT 42 AS x")?;
+
+        let mut dst = Connection::open(&dst_path)?;
+        dst.execute_batch("CREATE TABLE original(y INTEGER); INSERT INTO original VALUES(7);")?;
+
+        {
+            let backup = Backup::new(&src, &mut dst)?;
+            let outcome =
+                backup.run_to_completion_with_callback(1, Duration::ZERO, 3, |_, _| {
+                    BackupControl::Abort
+                })?;
+            assert_eq!(BackupRunOutcome::Aborted, outcome);
+        }
+
+        // dropping an unfinished backup leaves the destination's own schema
+        // and data alone, and the connection keeps working
+        assert_eq!(
+            7,
+            dst.one_column::<i64, _>("SELECT y FROM original", [])?
+        );
+        dst.execute_batch("INSERT INTO original VALUES(8)")?;
+        assert_eq!(
+            2,
+            dst.one_column::<i64, _>("SELECT COUNT(*) FROM original", [])?
+        );
         Ok(())
     }
 }

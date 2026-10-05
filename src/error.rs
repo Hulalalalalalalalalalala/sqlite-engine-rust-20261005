@@ -136,6 +136,11 @@ pub enum Error {
     /// given, the 2nd is how many were expected.
     InvalidParameterCount(usize, usize),
 
+    /// Error when the value of a parameter passed to a function is invalid
+    /// (for example, a non-positive page count or lock-conflict limit for
+    /// [`backup::Backup::run_to_completion_with_callback`](crate::backup::Backup::run_to_completion_with_callback)).
+    InvalidParameter(String),
+
     /// Returned from various functions in the Blob IO positional API. For
     /// example,
     /// [`Blob::raw_read_at_exact`](crate::blob::Blob::raw_read_at_exact) will
@@ -201,6 +206,7 @@ impl PartialEq for Error {
             (Self::InvalidParameterCount(i1, n1), Self::InvalidParameterCount(i2, n2)) => {
                 i1 == i2 && n1 == n2
             }
+            (Self::InvalidParameter(p1), Self::InvalidParameter(p2)) => p1 == p2,
             #[cfg(feature = "blob")]
             (Self::BlobSizeError, Self::BlobSizeError) => true,
             (
@@ -316,6 +322,7 @@ impl fmt::Display for Error {
                 f,
                 "Wrong number of parameters passed to query. Got {i1}, needed {n1}"
             ),
+            Self::InvalidParameter(ref msg) => write!(f, "Invalid parameter: {msg}"),
             Self::StatementChangedRows(i) => write!(f, "Query changed {i} rows"),
 
             #[cfg(feature = "functions")]
@@ -369,6 +376,7 @@ impl error::Error for Error {
             | Self::InvalidColumnType(..)
             | Self::InvalidPath(_)
             | Self::InvalidParameterCount(..)
+            | Self::InvalidParameter(_)
             | Self::StatementChangedRows(_)
             | Self::InvalidQuery
             | Self::MultipleStatement => None,
