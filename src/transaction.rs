@@ -63,6 +63,9 @@ pub enum DropBehavior {
 pub struct Transaction<'conn> {
     conn: &'conn Connection,
     drop_behavior: DropBehavior,
+    /// Set once an explicit finish has been attempted, so that the `Drop`
+    /// impl does not try to commit or roll back a second time.
+    finished: bool,
 }
 
 /// Represents a savepoint on a database connection.
@@ -93,7 +96,15 @@ pub struct Savepoint<'conn> {
     conn: &'conn Connection,
     name: String,
     drop_behavior: DropBehavior,
+    /// Set once the savepoint has been released or an explicit finish has
+    /// been attempted, so that the `Drop` impl does not act a second time.
     committed: bool,
+    /// Whether this savepoint began the transaction (i.e. it was created
+    /// while the connection was in autocommit mode). Releasing such a
+    /// savepoint commits the whole transaction, so cleaning up after a
+    /// failed release requires rolling the transaction back; a nested
+    /// savepoint may only roll back to itself and release itself.
+    starts_transaction: bool,
 }
 
 impl Transaction<'_> {
@@ -126,6 +137,7 @@ impl Transaction<'_> {
         conn.execute_batch(query).map(move |()| Transaction {
             conn,
             drop_behavior: DropBehavior::Rollback,
+            finished: false,
         })
     }
 
@@ -211,6 +223,14 @@ impl Transaction<'_> {
     ///
     /// Functionally equivalent to the `Drop` implementation, but allows
     /// callers to see any errors that occur.
+    ///
+    /// ## Note
+    ///
+    /// With [`DropBehavior::Commit`], the commit is attempted only once. If
+    /// it fails, a single best-effort rollback is attempted to return the
+    /// connection to autocommit mode, but the original commit error is
+    /// returned (even if the cleanup also fails), and the transaction is
+    /// left alone when it is dropped.
     #[inline]
     pub fn finish(mut self) -> Result<()> {
         self.finish_()
@@ -218,11 +238,28 @@ impl Transaction<'_> {
 
     #[inline]
     fn finish_(&mut self) -> Result<()> {
-        if self.conn.is_autocommit() {
+        if self.finished || self.conn.is_autocommit() {
             return Ok(());
         }
+        // An explicit finish gets a single attempt; make sure the `Drop`
+        // impl does not commit or roll back again afterwards.
+        self.finished = true;
         match self.drop_behavior() {
-            DropBehavior::Commit => self.commit_().or_else(|_| self.rollback_()),
+            DropBehavior::Commit => match self.commit_() {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    // The commit failed, so the changes were not persisted.
+                    // Try to roll back to leave the connection usable, but
+                    // always report the original commit error, even if the
+                    // cleanup fails. SQLite may already have ended the
+                    // transaction itself (e.g. when an authorizer denied the
+                    // commit), in which case there is nothing to clean up.
+                    if !self.conn.is_autocommit() {
+                        let _ = self.rollback_();
+                    }
+                    Err(err)
+                }
+            },
             DropBehavior::Rollback => self.rollback_(),
             DropBehavior::Ignore => Ok(()),
             DropBehavior::Panic => panic!("Transaction dropped unexpectedly."),
@@ -252,11 +289,15 @@ impl Savepoint<'_> {
     fn with_name_<T: Into<String>>(conn: &Connection, name: T) -> Result<Savepoint<'_>> {
         let name = name.into();
         let sql = cmd("SAVEPOINT", false, name.as_str())?;
+        // A savepoint created outside of any transaction begins one, so its
+        // release commits the whole transaction.
+        let starts_transaction = conn.is_autocommit();
         conn.execute_batch(sql.as_str()).map(|()| Savepoint {
             conn,
             name,
             drop_behavior: DropBehavior::Rollback,
             committed: false,
+            starts_transaction,
         })
     }
 
@@ -335,6 +376,15 @@ impl Savepoint<'_> {
     ///
     /// Functionally equivalent to the `Drop` implementation, but allows
     /// callers to see any errors that occur.
+    ///
+    /// ## Note
+    ///
+    /// With [`DropBehavior::Commit`], the release is attempted only once. If
+    /// it fails, a single best-effort cleanup is attempted (rolling back the
+    /// transaction if this savepoint began it, or rolling back to and
+    /// releasing this savepoint if it is nested), but the original release
+    /// error is returned (even if the cleanup also fails), and the savepoint
+    /// is left alone when it is dropped.
     #[inline]
     pub fn finish(mut self) -> Result<()> {
         self.finish_()
@@ -345,13 +395,49 @@ impl Savepoint<'_> {
         if self.committed {
             return Ok(());
         }
+        // An explicit finish gets a single attempt; make sure the `Drop`
+        // impl does not release or roll back again afterwards.
+        self.committed = true;
         match self.drop_behavior() {
-            DropBehavior::Commit => self
-                .commit_()
-                .or_else(|_| self.rollback().and_then(|()| self.commit_())),
+            DropBehavior::Commit => match self.commit_() {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    // The release failed, so the savepoint is still active.
+                    // Clean up according to the savepoint's scope, but always
+                    // report the original release error, even if the cleanup
+                    // fails.
+                    self.cleanup_after_failed_commit();
+                    Err(err)
+                }
+            },
             DropBehavior::Rollback => self.rollback().and_then(|()| self.commit_()),
             DropBehavior::Ignore => Ok(()),
             DropBehavior::Panic => panic!("Savepoint dropped unexpectedly."),
+        }
+    }
+
+    /// Best-effort cleanup after a failed release, limited to the changes
+    /// this savepoint is responsible for. The outcome is ignored: callers
+    /// report the release error, and a failed cleanup leaves the still
+    /// active transaction or savepoint for the caller to resolve.
+    #[inline]
+    fn cleanup_after_failed_commit(&mut self) {
+        if self.conn.is_autocommit() {
+            // SQLite already ended the transaction on its own; there is
+            // nothing left to clean up.
+            return;
+        }
+        if self.starts_transaction {
+            // Releasing this savepoint would have committed the whole
+            // transaction, so roll the transaction back to undo the changes
+            // and return the connection to autocommit mode.
+            let _ = self.conn.execute_batch("ROLLBACK");
+        } else {
+            // Nested savepoint: undo only the changes made since it was
+            // established, then release it, preserving the outer
+            // transaction. If the rollback is not possible, do not release
+            // either, as that would keep the changes.
+            let _ = self.rollback().and_then(|()| self.commit_());
         }
     }
 }
@@ -836,5 +922,362 @@ mod test {
             assert_eq!(TransactionState::None, db.transaction_state(DEFAULT_NAME)?);
         }
         Ok(())
+    }
+
+    fn assert_fk_error(e: &Error) {
+        match e {
+            Error::SqliteFailure(ffi_err, Some(msg)) => {
+                assert_eq!(crate::ErrorCode::ConstraintViolation, ffi_err.code);
+                assert_eq!(
+                    crate::ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+                    ffi_err.extended_code
+                );
+                assert!(msg.contains("FOREIGN KEY"), "unexpected message: {msg}");
+            }
+            _ => panic!("expected a foreign key constraint error, got {e:?}"),
+        }
+    }
+
+    fn assert_auth_error(e: &Error) {
+        match e {
+            Error::SqliteFailure(ffi_err, _) => {
+                assert_eq!(
+                    crate::ErrorCode::AuthorizationForStatementDenied,
+                    ffi_err.code
+                );
+                assert_eq!(crate::ffi::SQLITE_AUTH, ffi_err.extended_code);
+            }
+            _ => panic!("expected an authorization error, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_finish_commit_fk_failure() -> Result<()> {
+        let mut db = checked_memory_handle()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        db.execute_batch(
+            "CREATE TABLE r(n INTEGER PRIMARY KEY NOT NULL);
+             CREATE TABLE f(n REFERENCES r(n) DEFERRABLE INITIALLY DEFERRED);",
+        )?;
+        let err = {
+            let mut tx = db.transaction()?;
+            tx.execute("INSERT INTO f VALUES (0)", [])?;
+            tx.set_drop_behavior(DropBehavior::Commit);
+            tx.finish().unwrap_err()
+        };
+        // the commit error is reported, even though the cleanup rollback succeeded
+        assert_fk_error(&err);
+        // the cleanup rollback restored autocommit and undid the changes
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM f", [])?);
+        // a new transaction can be started
+        db.transaction()?.commit()
+    }
+
+    #[test]
+    fn test_finish_commit_busy() -> Result<()> {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("finish_busy.db3");
+        Connection::open(&path)?
+            .execute_batch("CREATE TABLE foo(x INTEGER); INSERT INTO foo VALUES(42);")?;
+
+        let mut db1 = Connection::open(&path)?;
+        let db2 = Connection::open(&path)?;
+        db1.busy_timeout(Duration::from_millis(0))?;
+        db2.busy_timeout(Duration::from_millis(0))?;
+
+        // db2 holds a read transaction, so db1's commit cannot get the
+        // exclusive lock it needs in rollback journal mode
+        db2.execute_batch("BEGIN")?;
+        db2.query_row("SELECT x FROM foo LIMIT 1", [], |_| Ok(()))?;
+
+        let err = {
+            let mut tx = db1.transaction()?;
+            tx.execute_batch("INSERT INTO foo VALUES(1)")?;
+            tx.set_drop_behavior(DropBehavior::Commit);
+            tx.finish().unwrap_err()
+        };
+        match &err {
+            Error::SqliteFailure(ffi_err, _) => {
+                assert_eq!(crate::ErrorCode::DatabaseBusy, ffi_err.code);
+            }
+            _ => panic!("expected a busy error, got {err:?}"),
+        }
+        // the cleanup rollback restored autocommit and undid the write
+        assert!(db1.is_autocommit());
+        assert_eq!(1, db1.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        db2.execute_batch("ROLLBACK")?;
+        // a new transaction can be started
+        db1.transaction()?.commit()
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn test_finish_commit_cleanup_rollback_denied() -> Result<()> {
+        use crate::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let mut db = checked_memory_handle()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        db.execute_batch(
+            "CREATE TABLE r(n INTEGER PRIMARY KEY NOT NULL);
+             CREATE TABLE f(n REFERENCES r(n) DEFERRABLE INITIALLY DEFERRED);",
+        )?;
+        let deny_rollback = Arc::new(AtomicBool::new(true));
+        {
+            let deny_rollback = Arc::clone(&deny_rollback);
+            db.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } if deny_rollback.load(Ordering::SeqCst) => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))?;
+        }
+        let err = {
+            let mut tx = db.transaction()?;
+            tx.execute("INSERT INTO f VALUES (0)", [])?;
+            tx.set_drop_behavior(DropBehavior::Commit);
+            tx.finish().unwrap_err()
+        };
+        // the original commit error is reported, not the denied cleanup rollback
+        assert_fk_error(&err);
+        // the cleanup rollback was denied, so the transaction is still active
+        assert!(!db.is_autocommit());
+        // the caller can lift the restriction and resolve the transaction
+        deny_rollback.store(false, Ordering::SeqCst);
+        db.execute_batch("ROLLBACK")?;
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM f", [])?);
+        Ok(())
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn test_finish_rollback_denied() -> Result<()> {
+        use crate::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let mut db = checked_memory_handle()?;
+        let deny_rollback = Arc::new(AtomicBool::new(true));
+        {
+            let deny_rollback = Arc::clone(&deny_rollback);
+            db.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } if deny_rollback.load(Ordering::SeqCst) => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))?;
+        }
+        let err = {
+            let tx = db.transaction()?;
+            tx.execute_batch("INSERT INTO foo VALUES(1)")?;
+            // default drop behavior: rollback
+            tx.finish().unwrap_err()
+        };
+        assert_auth_error(&err);
+        // the rollback was denied, so the transaction is still active
+        assert!(!db.is_autocommit());
+        // the caller can lift the restriction and keep using the connection
+        deny_rollback.store(false, Ordering::SeqCst);
+        db.execute_batch("COMMIT")?;
+        assert!(db.is_autocommit());
+        assert_current_sum(1, &db)
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn test_finish_commit_denied_by_authorizer() -> Result<()> {
+        use crate::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mut db = checked_memory_handle()?;
+        let commit_attempts = Arc::new(AtomicUsize::new(0));
+        let rollback_attempts = Arc::new(AtomicUsize::new(0));
+        {
+            let commit_attempts = Arc::clone(&commit_attempts);
+            let rollback_attempts = Arc::clone(&rollback_attempts);
+            db.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Begin,
+                } => Authorization::Allow,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => {
+                    rollback_attempts.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Allow
+                }
+                AuthAction::Transaction { .. } => {
+                    // COMMIT
+                    commit_attempts.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            }))?;
+        }
+        let err = {
+            let mut tx = db.transaction()?;
+            tx.execute_batch("INSERT INTO foo VALUES(1)")?;
+            tx.set_drop_behavior(DropBehavior::Commit);
+            tx.finish().unwrap_err()
+        };
+        // the denial is reported as-is
+        assert_auth_error(&err);
+        // SQLite left the transaction active when the commit was denied, so
+        // a single cleanup rollback was attempted (and allowed)
+        assert!(db.is_autocommit());
+        assert_eq!(1, rollback_attempts.load(Ordering::SeqCst));
+        // the commit was attempted exactly once (dropping the finished
+        // transaction did not retry it)
+        assert_eq!(1, commit_attempts.load(Ordering::SeqCst));
+        // nothing was committed
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        db.execute_batch("INSERT INTO foo VALUES(2)")?;
+        assert_current_sum(2, &db)
+    }
+
+    #[test]
+    fn test_savepoint_finish_commit_fk_failure() -> Result<()> {
+        let mut db = checked_memory_handle()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        db.execute_batch(
+            "CREATE TABLE r(n INTEGER PRIMARY KEY NOT NULL);
+             CREATE TABLE f(n REFERENCES r(n) DEFERRABLE INITIALLY DEFERRED);",
+        )?;
+        let err = {
+            let mut sp = db.savepoint()?;
+            sp.execute("INSERT INTO f VALUES (0)", [])?;
+            sp.set_drop_behavior(DropBehavior::Commit);
+            sp.finish().unwrap_err()
+        };
+        // the release error is reported, even though the cleanup succeeded
+        assert_fk_error(&err);
+        // the savepoint began the transaction, so the cleanup rollback
+        // restored autocommit and undid the changes
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM f", [])?);
+        // a new transaction can be started
+        db.transaction()?.commit()
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn test_nested_savepoint_finish_commit_release_denied() -> Result<()> {
+        use crate::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let mut db = checked_memory_handle()?;
+        // deny the first savepoint release only
+        let deny_release = Arc::new(AtomicBool::new(true));
+        let releases = Arc::new(AtomicUsize::new(0));
+        {
+            let deny_release = Arc::clone(&deny_release);
+            let releases = Arc::clone(&releases);
+            db.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Savepoint {
+                    operation: TransactionOperation::Release,
+                    ..
+                } => {
+                    releases.fetch_add(1, Ordering::SeqCst);
+                    if deny_release.swap(false, Ordering::SeqCst) {
+                        Authorization::Deny
+                    } else {
+                        Authorization::Allow
+                    }
+                }
+                _ => Authorization::Allow,
+            }))?;
+        }
+        let mut tx = db.transaction()?;
+        tx.execute_batch("INSERT INTO foo VALUES(1)")?;
+        let err = {
+            let mut sp = tx.savepoint()?;
+            sp.execute_batch("INSERT INTO foo VALUES(2)")?;
+            sp.set_drop_behavior(DropBehavior::Commit);
+            sp.finish().unwrap_err()
+        };
+        // the denied release is reported
+        assert_auth_error(&err);
+        // the cleanup undid only the savepoint's changes and released it:
+        // one failed release plus one cleanup release, and no further release
+        // when the savepoint was dropped
+        assert_eq!(2, releases.load(Ordering::SeqCst));
+        assert_current_sum(1, &tx)?;
+        // the outer transaction is preserved and can still commit
+        tx.execute_batch("INSERT INTO foo VALUES(4)")?;
+        tx.commit()?;
+        assert_current_sum(5, &db)
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn test_savepoint_finish_rollback_release_denied() -> Result<()> {
+        use crate::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let mut db = checked_memory_handle()?;
+        let deny_release = Arc::new(AtomicBool::new(true));
+        {
+            let deny_release = Arc::clone(&deny_release);
+            db.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Savepoint {
+                    operation: TransactionOperation::Release,
+                    ..
+                } if deny_release.load(Ordering::SeqCst) => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))?;
+        }
+        let mut tx = db.transaction()?;
+        tx.execute_batch("INSERT INTO foo VALUES(1)")?;
+        let err = {
+            let sp = tx.savepoint()?;
+            sp.execute_batch("INSERT INTO foo VALUES(2)")?;
+            // default drop behavior: roll back to the savepoint, then release it
+            sp.finish().unwrap_err()
+        };
+        // the rollback to the savepoint was allowed, but releasing it was
+        // denied, and that first error is reported
+        assert_auth_error(&err);
+        // the savepoint's changes were rolled back...
+        assert_current_sum(1, &tx)?;
+        // ...and the savepoint is still active, so the caller can lift the
+        // restriction and release it explicitly
+        deny_release.store(false, Ordering::SeqCst);
+        tx.execute_batch("RELEASE _rusqlite_sp")?;
+        tx.execute_batch("INSERT INTO foo VALUES(4)")?;
+        tx.commit()?;
+        assert_current_sum(5, &db)
+    }
+
+    #[test]
+    fn test_nested_savepoint_release_defers_fk_check() -> Result<()> {
+        let mut db = checked_memory_handle()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        db.execute_batch(
+            "CREATE TABLE r(n INTEGER PRIMARY KEY NOT NULL);
+             CREATE TABLE f(n REFERENCES r(n) DEFERRABLE INITIALLY DEFERRED);",
+        )?;
+        let mut tx = db.transaction()?;
+        {
+            let mut sp = tx.savepoint()?;
+            sp.execute("INSERT INTO f VALUES (0)", [])?;
+            sp.set_drop_behavior(DropBehavior::Commit);
+            // releasing a nested savepoint must not check the deferred
+            // foreign key constraints yet
+            sp.finish()?;
+        }
+        // repair the violation before the outer commit checks it
+        tx.execute("INSERT INTO r VALUES (0)", [])?;
+        tx.commit()
     }
 }
