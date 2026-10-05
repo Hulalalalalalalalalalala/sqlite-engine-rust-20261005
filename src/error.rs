@@ -159,6 +159,12 @@ pub enum Error {
     /// Error when the schema of a particular database is requested, but the index
     /// is out of range.
     InvalidDatabaseIndex(usize),
+    /// Error returned by
+    /// [`backup::Backup::run_to_completion_with_progress`](crate::backup::Backup::run_to_completion_with_progress)
+    /// when one of its parameters is invalid (e.g. a non-positive number of
+    /// pages per step or a non-positive number of consecutive lock conflicts).
+    #[cfg(feature = "backup")]
+    InvalidBackupParameter(String),
 }
 
 impl PartialEq for Error {
@@ -220,6 +226,8 @@ impl PartialEq for Error {
             #[cfg(feature = "loadable_extension")]
             (Self::InitError(e1), Self::InitError(e2)) => e1 == e2,
             (Self::InvalidDatabaseIndex(i1), Self::InvalidDatabaseIndex(i2)) => i1 == i2,
+            #[cfg(feature = "backup")]
+            (Self::InvalidBackupParameter(s1), Self::InvalidBackupParameter(s2)) => s1 == s2,
             (..) => false,
         }
     }
@@ -347,6 +355,8 @@ impl fmt::Display for Error {
             #[cfg(feature = "loadable_extension")]
             Self::InitError(ref err) => err.fmt(f),
             Self::InvalidDatabaseIndex(i) => write!(f, "Invalid database index: {i}"),
+            #[cfg(feature = "backup")]
+            Self::InvalidBackupParameter(ref s) => write!(f, "Invalid backup parameter: {s}"),
         }
     }
 }
@@ -398,6 +408,8 @@ impl error::Error for Error {
             #[cfg(feature = "loadable_extension")]
             Self::InitError(ref err) => Some(err),
             Self::InvalidDatabaseIndex(_) => None,
+            #[cfg(feature = "backup")]
+            Self::InvalidBackupParameter(_) => None,
         }
     }
 }
