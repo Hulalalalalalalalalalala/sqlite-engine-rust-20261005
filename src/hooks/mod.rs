@@ -454,12 +454,45 @@ impl Connection {
 
     /// Register an authorizer callback that's invoked
     /// as a statement is being prepared.
+    ///
+    /// This hook shares its registration with
+    /// [`try_authorizer`](Connection::try_authorizer): the most recently
+    /// registered hook wins, and unregistering either one removes the
+    /// currently registered hook.
     #[inline]
     pub fn authorizer<F>(&mut self, hook: Option<F>) -> Result<()>
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
     {
         self.db.borrow_mut().authorizer(hook)
+    }
+
+    /// Register an authorizer callback that's invoked
+    /// as a statement is being prepared, with the ability to report
+    /// why an access was rejected.
+    ///
+    /// The callback returns `Ok(Authorization::Allow)` to allow the access,
+    /// `Ok(Authorization::Ignore)` to silently ignore it (a read of the
+    /// column yields `NULL`), or `Ok(Authorization::Deny)` to reject it with
+    /// the same error an [`authorizer`](Connection::authorizer) denial
+    /// produces. Returning `Err(e)` rejects the access and has the call that
+    /// triggered the check fail with `e`: a check that runs while a statement
+    /// is first prepared is reported by the preparing call, while a check
+    /// that runs because a schema change re-prepares an already-prepared
+    /// statement is reported by the executing or row-fetching call. If the
+    /// callback panics, the access is rejected and the triggering call fails
+    /// with [`Error::UnwindingPanic`].
+    ///
+    /// This hook shares its registration with
+    /// [`authorizer`](Connection::authorizer): the most recently registered
+    /// hook wins, and unregistering either one removes the currently
+    /// registered hook. A rejected access does not unregister the hook.
+    #[inline]
+    pub fn try_authorizer<F>(&mut self, hook: Option<F>) -> Result<()>
+    where
+        F: for<'r> FnMut(AuthContext<'r>) -> Result<Authorization> + Send + 'static,
+    {
+        self.db.borrow_mut().try_authorizer(hook)
     }
 }
 
@@ -578,6 +611,105 @@ pub(crate) unsafe fn take_try_commit_hook_error(
     }
     let state = unsafe { ffi::sqlite3_get_clientdata(db, c"sqlite3_commit_hook".as_ptr()) }
         .cast::<CommitHookState>();
+    if state.is_null() {
+        return None;
+    }
+    unsafe { (*state).error.take() }
+}
+
+/// The authorizer registered on a connection.
+///
+/// Both `authorizer` and `try_authorizer` share this single registration:
+/// the most recent call to either entry point replaces the previous
+/// authorizer, and unregistering either one removes whichever authorizer is
+/// current.
+enum Authorizer {
+    Simple(Box<dyn for<'r> FnMut(AuthContext<'r>) -> Authorization + Send>),
+    Fallible(Box<dyn for<'r> FnMut(AuthContext<'r>) -> Result<Authorization> + Send>),
+}
+
+struct AuthorizerState {
+    hook: Authorizer,
+    /// The reason the fallible authorizer rejected the most recent access
+    /// check, to be reported by the call whose (re-)prepare SQLite fails
+    /// with a generic `SQLITE_ERROR` ("authorizer malfunction"). Reset on
+    /// every callback invocation, so a stale reason can never be attributed
+    /// to a later failure.
+    error: Option<Error>,
+}
+
+/// Return code the fallible authorizer uses to reject an access check.
+/// SQLite only maps `SQLITE_OK`/`SQLITE_IGNORE`/`SQLITE_DENY` to decisions;
+/// any other value aborts the prepare with a generic `SQLITE_ERROR`
+/// ("authorizer malfunction"), which the error-decoding path then replaces
+/// with the stored reason. `SQLITE_ERROR` itself cannot be used here: it
+/// has the same value as `SQLITE_DENY`.
+const AUTH_REJECT: c_int = ffi::SQLITE_MISUSE;
+
+unsafe extern "C" fn authorizer_callback(
+    p_arg: *mut c_void,
+    action_code: c_int,
+    param1: *const c_char,
+    param2: *const c_char,
+    db_name: *const c_char,
+    trigger_or_view_name: *const c_char,
+) -> c_int {
+    unsafe {
+        let state: *mut AuthorizerState = p_arg.cast();
+        (*state).error = None;
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let action = AuthAction::from_raw(
+                action_code,
+                expect_optional_utf8(param1, "authorizer param 1"),
+                expect_optional_utf8(param2, "authorizer param 2"),
+            );
+            let auth_ctx = AuthContext {
+                action,
+                database_name: expect_optional_utf8(db_name, "database name"),
+                accessor: expect_optional_utf8(
+                    trigger_or_view_name,
+                    "accessor (inner-most trigger or view)",
+                ),
+            };
+            match &mut (*state).hook {
+                Authorizer::Simple(hook) => hook(auth_ctx).into_raw(),
+                Authorizer::Fallible(hook) => match hook(auth_ctx) {
+                    Ok(auth) => auth.into_raw(),
+                    Err(err) => {
+                        (*state).error = Some(err);
+                        AUTH_REJECT
+                    }
+                },
+            }
+        }));
+        match r {
+            Ok(code) => code,
+            Err(_) => match &(*state).hook {
+                // A panicking fallible authorizer rejects the access and
+                // reports `Error::UnwindingPanic`.
+                Authorizer::Fallible(_) => {
+                    (*state).error = Some(Error::UnwindingPanic);
+                    AUTH_REJECT
+                }
+                // A panicking simple authorizer keeps its historical
+                // behavior of a generic SQLite error.
+                Authorizer::Simple(_) => ffi::SQLITE_ERROR,
+            },
+        }
+    }
+}
+
+/// If `code` is the generic `SQLITE_ERROR` that SQLite produces when the
+/// fallible authorizer on `db` rejected an access check ("authorizer
+/// malfunction") and the currently registered authorizer provided a reason,
+/// take and return it. The reason is consumed, so it is reported at most
+/// once, by the call that triggered the check.
+pub(crate) unsafe fn take_authorizer_error(db: *mut ffi::sqlite3, code: c_int) -> Option<Error> {
+    if db.is_null() || code != ffi::SQLITE_ERROR {
+        return None;
+    }
+    let state = unsafe { ffi::sqlite3_get_clientdata(db, c"sqlite3_set_authorizer".as_ptr()) }
+        .cast::<AuthorizerState>();
     if state.is_null() {
         return None;
     }
@@ -856,47 +988,41 @@ impl InnerConnection {
     ///     Ok(())
     /// }
     /// ```
-    fn authorizer<'c, F>(&'c mut self, authorizer: Option<F>) -> Result<()>
+    fn authorizer<F>(&mut self, authorizer: Option<F>) -> Result<()>
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
     {
-        unsafe extern "C" fn call_boxed_closure<'c, F>(
-            p_arg: *mut c_void,
-            action_code: c_int,
-            param1: *const c_char,
-            param2: *const c_char,
-            db_name: *const c_char,
-            trigger_or_view_name: *const c_char,
-        ) -> c_int
-        where
-            F: FnMut(AuthContext<'c>) -> Authorization + Send + 'static,
-        {
-            unsafe {
-                catch_unwind(|| {
-                    let action = AuthAction::from_raw(
-                        action_code,
-                        expect_optional_utf8(param1, "authorizer param 1"),
-                        expect_optional_utf8(param2, "authorizer param 2"),
-                    );
-                    let auth_ctx = AuthContext {
-                        action,
-                        database_name: expect_optional_utf8(db_name, "database name"),
-                        accessor: expect_optional_utf8(
-                            trigger_or_view_name,
-                            "accessor (inner-most trigger or view)",
-                        ),
-                    };
-                    let boxed_hook: *mut F = p_arg.cast::<F>();
-                    (*boxed_hook)(auth_ctx)
-                })
-                .map_or_else(|_| ffi::SQLITE_ERROR, Authorization::into_raw)
-            }
-        }
+        self.set_authorizer(authorizer.map(|hook| Authorizer::Simple(Box::new(hook))))
+    }
 
-        let x_auth = authorizer
-            .as_ref()
-            .map(|_| call_boxed_closure::<'c, F> as _);
-        self.set_clientdata(c"sqlite3_set_authorizer", authorizer, |db, bh| unsafe {
+    /// ```compile_fail
+    /// use rusqlite::{Connection, Result};
+    /// fn main() -> Result<()> {
+    ///     let mut db = Connection::open_in_memory()?;
+    ///     {
+    ///         let mut called = std::sync::atomic::AtomicBool::new(false);
+    ///         db.try_authorizer(Some(|_: rusqlite::hooks::AuthContext<'_>| {
+    ///             called.store(true, std::sync::atomic::Ordering::Relaxed);
+    ///             Ok(rusqlite::hooks::Authorization::Deny)
+    ///         }));
+    ///     }
+    ///     assert!(db
+    ///         .execute_batch("BEGIN; CREATE TABLE foo (t TEXT); COMMIT;")
+    ///         .is_err());
+    ///     Ok(())
+    /// }
+    /// ```
+    fn try_authorizer<F>(&mut self, authorizer: Option<F>) -> Result<()>
+    where
+        F: for<'r> FnMut(AuthContext<'r>) -> Result<Authorization> + Send + 'static,
+    {
+        self.set_authorizer(authorizer.map(|hook| Authorizer::Fallible(Box::new(hook))))
+    }
+
+    fn set_authorizer(&mut self, authorizer: Option<Authorizer>) -> Result<()> {
+        let state = authorizer.map(|hook| AuthorizerState { hook, error: None });
+        let x_auth = state.as_ref().map(|_| authorizer_callback as _);
+        self.set_clientdata(c"sqlite3_set_authorizer", state, |db, bh| unsafe {
             ffi::sqlite3_set_authorizer(db, x_auth, bh)
         })?;
         Ok(())
@@ -2088,6 +2214,548 @@ mod test {
         // the other connection is unaffected by db1's hook error
         db2.execute("INSERT INTO foo VALUES (3)", [])?;
         assert_eq!(1, db1.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    fn read_foo_err(
+        ctx: super::AuthContext<'_>,
+        reject: &AtomicBool,
+    ) -> Result<super::Authorization> {
+        use super::{AuthAction, Authorization};
+        match ctx.action {
+            AuthAction::Read {
+                table_name: "foo", ..
+            } if reject.load(Ordering::SeqCst) => Err(custom_err()),
+            _ => Ok(Authorization::Allow),
+        }
+    }
+
+    #[test]
+    fn test_try_authorizer_ok_variants() -> Result<()> {
+        use super::{AuthAction, AuthContext, Authorization};
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (public TEXT, private TEXT)")?;
+
+        let authorizer = move |ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Read {
+                column_name: "private",
+                ..
+            } => Ok(Authorization::Ignore),
+            AuthAction::DropTable { .. } => Ok(Authorization::Deny),
+            _ => Ok(Authorization::Allow),
+        };
+
+        db.try_authorizer(Some(authorizer))?;
+        db.execute_batch(
+            "BEGIN TRANSACTION; INSERT INTO foo VALUES ('pub txt', 'priv txt'); COMMIT;",
+        )?;
+        // an ignored column read yields NULL
+        db.query_row_and_then("SELECT * FROM foo", [], |row| -> Result<()> {
+            assert_eq!(row.get::<_, String>("public")?, "pub txt");
+            assert!(row.get::<_, Option<String>>("private")?.is_none());
+            Ok(())
+        })?;
+        // Ok(Deny) rejects like the plain authorizer
+        let err = db.execute_batch("DROP TABLE foo").unwrap_err();
+        match &err {
+            Error::SqliteFailure(ffi_err, _) => {
+                assert_eq!(crate::ffi::SQLITE_AUTH, ffi_err.extended_code);
+            }
+            other => panic!("expected SqliteFailure, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_deny_matches_authorizer() -> Result<()> {
+        use super::{AuthContext, Authorization};
+
+        fn deny(_: AuthContext<'_>) -> Authorization {
+            Authorization::Deny
+        }
+        fn try_deny(_: AuthContext<'_>) -> Result<Authorization> {
+            Ok(Authorization::Deny)
+        }
+
+        let mut db1 = foo_table()?;
+        db1.authorizer(Some(deny))?;
+        let mut db2 = foo_table()?;
+        db2.try_authorizer(Some(try_deny))?;
+
+        let e1 = db1.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+        let e2 = db2.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+        // Ok(Deny) rejects exactly like the existing authorizer
+        assert_eq!(e1, e2);
+        match &e2 {
+            Error::SqliteFailure(ffi_err, _) => {
+                assert_eq!(crate::ffi::SQLITE_AUTH, ffi_err.extended_code);
+            }
+            other => panic!("expected SqliteFailure, got {other:?}"),
+        }
+        db2.try_authorizer(None::<fn(super::AuthContext<'_>) -> Result<Authorization>>)?;
+        assert_eq!(0, foo_count(&db2)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_error_propagates_from_prepare() -> Result<()> {
+        let mut db = foo_table()?;
+        let reject = Arc::new(AtomicBool::new(true));
+        let reject2 = Arc::clone(&reject);
+        db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| {
+            read_foo_err(ctx, &reject2)
+        }))?;
+
+        // the check runs while preparing, so the prepare call reports it
+        let err = db.prepare("SELECT x FROM foo").unwrap_err();
+        assert_custom_err(&err);
+        // convenience APIs that prepare internally report it too
+        let err = db
+            .one_column::<i32, _>("SELECT x FROM foo", [])
+            .unwrap_err();
+        assert_custom_err(&err);
+        // statements the authorizer allows are unaffected
+        db.execute("INSERT INTO foo VALUES (1)", [])?;
+        reject.store(false, Ordering::SeqCst);
+        assert_eq!(1, foo_count(&db)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_error_propagates_from_reprepare() -> Result<()> {
+        let mut db = foo_table()?;
+        db.execute("INSERT INTO foo VALUES (1)", [])?;
+        let reject = Arc::new(AtomicBool::new(false));
+        let reject2 = Arc::clone(&reject);
+        db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| {
+            read_foo_err(ctx, &reject2)
+        }))?;
+
+        // prepared while reads are allowed
+        let mut stmt = db.prepare("SELECT x FROM foo")?;
+        assert_eq!(1, stmt.query_row([], |row| row.get::<_, i32>(0))?);
+
+        // a schema change makes the statement re-prepare on its next step;
+        // the check now fails and the stepping call reports the reason
+        reject.store(true, Ordering::SeqCst);
+        db.execute_batch("ALTER TABLE foo ADD COLUMN y INTEGER")?;
+        let mut rows = stmt.query([])?;
+        let err = rows.next().unwrap_err();
+        assert_custom_err(&err);
+        drop(rows);
+
+        // the failure does not stick to the statement
+        reject.store(false, Ordering::SeqCst);
+        assert_eq!(1, stmt.query_row([], |row| row.get::<_, i32>(0))?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_error_propagates_from_execute() -> Result<()> {
+        let mut db = foo_table()?;
+        let reject = Arc::new(AtomicBool::new(false));
+        let reject2 = Arc::clone(&reject);
+        db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| {
+            use super::{AuthAction, Authorization};
+            match ctx.action {
+                AuthAction::Insert { table_name: "foo" } if reject2.load(Ordering::SeqCst) => {
+                    Err(custom_err())
+                }
+                _ => Ok(Authorization::Allow),
+            }
+        }))?;
+
+        let mut stmt = db.prepare("INSERT INTO foo (x) VALUES (?1)")?;
+        stmt.execute([1])?;
+        // force a re-prepare at the next step, with the check now failing
+        reject.store(true, Ordering::SeqCst);
+        db.execute_batch("ALTER TABLE foo ADD COLUMN y INTEGER")?;
+        let err = stmt.execute([2]).unwrap_err();
+        assert_custom_err(&err);
+        // the failed statement can be executed again
+        reject.store(false, Ordering::SeqCst);
+        stmt.execute([2])?;
+        drop(stmt);
+        assert_eq!(2, foo_count(&db)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_panic() -> Result<()> {
+        use super::Authorization;
+
+        let mut db = foo_table()?;
+        db.try_authorizer(Some(|_: super::AuthContext<'_>| -> Result<Authorization> {
+            panic!("boom")
+        }))?;
+
+        let err = db.prepare("SELECT x FROM foo").unwrap_err();
+        assert_eq!(Error::UnwindingPanic, err);
+        let err = db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+        assert_eq!(Error::UnwindingPanic, err);
+
+        // the hook is still registered; removing it restores normal operation
+        db.try_authorizer(None::<fn(super::AuthContext<'_>) -> Result<Authorization>>)?;
+        db.execute("INSERT INTO foo VALUES (2)", [])?;
+        assert_eq!(1, foo_count(&db)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_not_unregistered_by_failure() -> Result<()> {
+        let mut db = foo_table()?;
+        let reject = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let reject = Arc::clone(&reject);
+            let calls = Arc::clone(&calls);
+            db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                read_foo_err(ctx, &reject)
+            }))?;
+        }
+        db.prepare("SELECT x FROM foo").unwrap_err();
+        reject.store(false, Ordering::SeqCst);
+        db.execute("INSERT INTO foo VALUES (1)", [])?;
+        assert_eq!(1, foo_count(&db)?);
+        // both statements were checked
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_consecutive_errors_are_distinct() -> Result<()> {
+        use super::{AuthAction, Authorization};
+
+        let mut db = foo_table()?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| match ctx.action {
+            AuthAction::Read {
+                table_name: "foo", ..
+            } => {
+                let n = calls2.fetch_add(1, Ordering::SeqCst);
+                Err(Error::ToSqlConversionFailure(
+                    format!("auth error {n}").into(),
+                ))
+            }
+            _ => Ok(Authorization::Allow),
+        }))?;
+        let e1 = db.prepare("SELECT x FROM foo").unwrap_err();
+        let e2 = db.prepare("SELECT x FROM foo").unwrap_err();
+        // each call gets the error of its own check, exactly once
+        assert!(e1.to_string().ends_with("auth error 0"));
+        assert!(e2.to_string().ends_with("auth error 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_error_does_not_mask_sql_errors() -> Result<()> {
+        let mut db = foo_table()?;
+        db.execute_batch("CREATE UNIQUE INDEX ux ON foo(x)")?;
+        let reject = Arc::new(AtomicBool::new(true));
+        let reject2 = Arc::clone(&reject);
+        db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| {
+            read_foo_err(ctx, &reject2)
+        }))?;
+        let err = db.prepare("SELECT x FROM foo").unwrap_err();
+        assert_custom_err(&err);
+        reject.store(false, Ordering::SeqCst);
+
+        // a genuine SQL error is reported as itself, not as a stale hook error
+        db.execute("INSERT INTO foo VALUES (1)", [])?;
+        let err = db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+        match &err {
+            Error::SqliteFailure(ffi_err, _) => {
+                assert_eq!(crate::ErrorCode::ConstraintViolation, ffi_err.code);
+            }
+            other => panic!("expected SqliteFailure, got {other:?}"),
+        }
+        // a syntax error keeps its own kind too
+        let err = db.prepare("SELEC x FROM foo").unwrap_err();
+        match &err {
+            Error::SqlInputError { .. } | Error::SqliteFailure(..) => {}
+            other => panic!("expected a SQL error, got {other:?}"),
+        }
+        // a generic SQLITE_ERROR is not rewritten either
+        db.execute_batch("BEGIN")?;
+        let err = db.execute_batch("BEGIN").unwrap_err();
+        match &err {
+            Error::SqliteFailure(ffi_err, _) => {
+                assert_eq!(crate::ErrorCode::Unknown, ffi_err.code);
+            }
+            other => panic!("expected SqliteFailure, got {other:?}"),
+        }
+        db.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_execute_batch() -> Result<()> {
+        use super::{AuthAction, Authorization};
+
+        let mut db = foo_table()?;
+        db.execute_batch("CREATE TABLE blocked (x INTEGER)")?;
+        db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| {
+            match ctx.action {
+                // allow the insert into foo, reject the one into blocked
+                AuthAction::Insert {
+                    table_name: "blocked",
+                } => Err(custom_err()),
+                _ => Ok(Authorization::Allow),
+            }
+        }))?;
+        let err = db
+            .execute_batch(
+                "INSERT INTO foo VALUES (1);
+                 INSERT INTO blocked VALUES (2);
+                 INSERT INTO foo VALUES (3);",
+            )
+            .unwrap_err();
+        assert_custom_err(&err);
+        // the batch stopped at the rejected statement; the first statement's
+        // own transaction was already committed and stays
+        assert_eq!(1, foo_count(&db)?);
+        assert_eq!(
+            0,
+            db.one_column::<i32, _>("SELECT COUNT(*) FROM blocked", [])?
+        );
+        assert!(db.is_autocommit());
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_transaction_untouched() -> Result<()> {
+        let mut db = foo_table()?;
+        let reject = Arc::new(AtomicBool::new(false));
+        let reject2 = Arc::clone(&reject);
+        db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| {
+            use super::{AuthAction, Authorization};
+            match ctx.action {
+                AuthAction::Insert { table_name: "foo" } if reject2.load(Ordering::SeqCst) => {
+                    Err(custom_err())
+                }
+                _ => Ok(Authorization::Allow),
+            }
+        }))?;
+        {
+            let tx = db.transaction()?;
+            tx.execute("INSERT INTO foo VALUES (1)", [])?;
+            reject.store(true, Ordering::SeqCst);
+            let err = tx.execute("INSERT INTO foo VALUES (2)", []).unwrap_err();
+            assert_custom_err(&err);
+            // the rejection neither committed nor rolled back the transaction
+            reject.store(false, Ordering::SeqCst);
+            tx.execute("INSERT INTO foo VALUES (3)", [])?;
+            tx.commit()?;
+        }
+        assert!(db.is_autocommit());
+        assert_eq!(2, foo_count(&db)?);
+        Ok(())
+    }
+
+    #[cfg(feature = "cache")]
+    #[test]
+    fn test_try_authorizer_cached_statement() -> Result<()> {
+        let mut db = foo_table()?;
+        db.execute("INSERT INTO foo VALUES (1)", [])?;
+        let reject = Arc::new(AtomicBool::new(false));
+        let reject2 = Arc::clone(&reject);
+        db.try_authorizer(Some(move |ctx: super::AuthContext<'_>| {
+            read_foo_err(ctx, &reject2)
+        }))?;
+        {
+            let mut stmt = db.prepare_cached("SELECT x FROM foo")?;
+            assert_eq!(1, stmt.query_row([], |row| row.get::<_, i32>(0))?);
+        }
+        // expire the cached statement and make its re-prepare fail
+        reject.store(true, Ordering::SeqCst);
+        db.execute_batch("ALTER TABLE foo ADD COLUMN y INTEGER")?;
+        {
+            let mut stmt = db.prepare_cached("SELECT x FROM foo")?;
+            let mut rows = stmt.query([])?;
+            let err = rows.next().unwrap_err();
+            assert_custom_err(&err);
+            // returned to the cache while the authorizer still fails
+        }
+        reject.store(false, Ordering::SeqCst);
+        {
+            // the cached statement does not carry the old error
+            let mut stmt = db.prepare_cached("SELECT x FROM foo")?;
+            assert_eq!(1, stmt.query_row([], |row| row.get::<_, i32>(0))?);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cache")]
+    #[test]
+    fn test_try_authorizer_cached_statement_reauthorized() -> Result<()> {
+        let mut db = foo_table()?;
+        db.execute("INSERT INTO foo VALUES (1)", [])?;
+        {
+            // cached while no authorizer is registered
+            let mut stmt = db.prepare_cached("SELECT x FROM foo")?;
+            assert_eq!(1, stmt.query_row([], |row| row.get::<_, i32>(0))?);
+        }
+        db.try_authorizer(Some(|ctx: super::AuthContext<'_>| {
+            read_foo_err(ctx, &AtomicBool::new(true))
+        }))?;
+        {
+            // the cached statement is checked by the current authorizer,
+            // not by the one in effect when it was prepared
+            let mut stmt = db.prepare_cached("SELECT x FROM foo")?;
+            let mut rows = stmt.query([])?;
+            let err = rows.next().unwrap_err();
+            assert_custom_err(&err);
+        }
+        // and once the authorizer is removed, the cached statement works again
+        db.try_authorizer(None::<fn(super::AuthContext<'_>) -> Result<super::Authorization>>)?;
+        {
+            let mut stmt = db.prepare_cached("SELECT x FROM foo")?;
+            assert_eq!(1, stmt.query_row([], |row| row.get::<_, i32>(0))?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_authorizers_share_registration() -> Result<()> {
+        use super::Authorization;
+
+        let mut db = foo_table()?;
+
+        // try_authorizer replaces authorizer
+        db.authorizer(Some(|_: super::AuthContext<'_>| Authorization::Deny))?;
+        db.try_authorizer(Some(|_: super::AuthContext<'_>| Ok(Authorization::Allow)))?;
+        db.execute("INSERT INTO foo VALUES (1)", [])?;
+
+        // authorizer replaces try_authorizer
+        db.try_authorizer(Some(|_: super::AuthContext<'_>| Err(custom_err())))?;
+        db.authorizer(Some(|_: super::AuthContext<'_>| Authorization::Allow))?;
+        db.execute("INSERT INTO foo VALUES (2)", [])?;
+
+        // unregistering via authorizer removes a try_authorizer
+        db.try_authorizer(Some(|_: super::AuthContext<'_>| Err(custom_err())))?;
+        db.authorizer(None::<fn(super::AuthContext<'_>) -> Authorization>)?;
+        db.execute("INSERT INTO foo VALUES (3)", [])?;
+
+        // unregistering via try_authorizer removes an authorizer
+        db.authorizer(Some(|_: super::AuthContext<'_>| Authorization::Deny))?;
+        db.try_authorizer(None::<fn(super::AuthContext<'_>) -> Result<Authorization>>)?;
+        db.execute("INSERT INTO foo VALUES (4)", [])?;
+
+        assert_eq!(4, foo_count(&db)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_authorizer_callback_freed_exactly_once() -> Result<()> {
+        use super::Authorization;
+
+        struct DropCounter(Arc<AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut db = Connection::open_in_memory()?;
+
+        // replaced by another try_authorizer
+        db.try_authorizer(Some({
+            let counter = DropCounter(Arc::clone(&drops));
+            move |_: super::AuthContext<'_>| -> Result<Authorization> {
+                let _ = &counter;
+                Ok(Authorization::Allow)
+            }
+        }))?;
+        assert_eq!(0, drops.load(Ordering::SeqCst));
+        db.try_authorizer(Some({
+            let counter = DropCounter(Arc::clone(&drops));
+            move |_: super::AuthContext<'_>| -> Result<Authorization> {
+                let _ = &counter;
+                Ok(Authorization::Allow)
+            }
+        }))?;
+        assert_eq!(1, drops.load(Ordering::SeqCst));
+
+        // replaced by an authorizer
+        db.authorizer(Some({
+            let counter = DropCounter(Arc::clone(&drops));
+            move |_: super::AuthContext<'_>| {
+                let _ = &counter;
+                Authorization::Allow
+            }
+        }))?;
+        assert_eq!(2, drops.load(Ordering::SeqCst));
+
+        // unregistered via try_authorizer
+        db.try_authorizer(None::<fn(super::AuthContext<'_>) -> Result<Authorization>>)?;
+        assert_eq!(3, drops.load(Ordering::SeqCst));
+
+        // freed when the connection is closed
+        db.try_authorizer(Some({
+            let counter = DropCounter(Arc::clone(&drops));
+            move |_: super::AuthContext<'_>| -> Result<Authorization> {
+                let _ = &counter;
+                Ok(Authorization::Allow)
+            }
+        }))?;
+        assert_eq!(3, drops.load(Ordering::SeqCst));
+        drop(db);
+        assert_eq!(4, drops.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_authorizer_statements_do_not_share_errors() -> Result<()> {
+        use super::{AuthAction, Authorization};
+
+        let mut db = foo_table()?;
+        db.execute_batch("CREATE TABLE bar (x INTEGER)")?;
+        db.try_authorizer(Some(|ctx: super::AuthContext<'_>| match ctx.action {
+            AuthAction::Read {
+                table_name: "foo", ..
+            } => Err(custom_err()),
+            _ => Ok(Authorization::Allow),
+        }))?;
+        // statement A fails its check...
+        let err = db.prepare("SELECT x FROM foo").unwrap_err();
+        assert_custom_err(&err);
+        // ...but statement B on the same connection is unaffected
+        let mut stmt = db.prepare("SELECT x FROM bar")?;
+        let mut rows = stmt.query([])?;
+        assert!(rows.next()?.is_none());
+        Ok(())
+    }
+
+    #[cfg_attr(
+        all(target_family = "wasm", target_os = "unknown"),
+        ignore = "no filesystem on this platform"
+    )]
+    #[test]
+    fn test_try_authorizer_other_connection() -> Result<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("try-authorizer.db3");
+
+        let mut db1 = Connection::open(&path)?;
+        db1.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let db2 = Connection::open(&path)?;
+
+        db1.try_authorizer(Some(|ctx: super::AuthContext<'_>| {
+            read_foo_err(ctx, &AtomicBool::new(true))
+        }))?;
+
+        // rejected read on db1
+        let err = db1.prepare("SELECT x FROM foo").unwrap_err();
+        assert_custom_err(&err);
+        // the other connection is unaffected by db1's authorizer error
+        db2.execute("INSERT INTO foo VALUES (1)", [])?;
+        assert_eq!(1, db2.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        // db1 can still run statements the authorizer allows
+        db1.execute("INSERT INTO foo VALUES (2)", [])?;
+        assert_eq!(2, db2.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
         Ok(())
     }
 }
