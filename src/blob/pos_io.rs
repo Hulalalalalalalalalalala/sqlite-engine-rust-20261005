@@ -25,9 +25,14 @@ impl Blob<'_> {
     /// [fext_write_at]: https://doc.rust-lang.org/std/os/unix/fs/trait.FileExt.html#tymethod.write_at
     #[inline]
     pub fn write_at(&mut self, buf: &[u8], write_start: usize) -> Result<()> {
+        self.check_valid()?;
         let len = self.len();
 
         if buf.len().saturating_add(write_start) > len {
+            // This path returns without calling into SQLite, so check for an
+            // invalidated handle explicitly: its `SQLITE_ABORT` takes
+            // precedence over the size error.
+            self.probe_validity()?;
             return Err(Error::BlobSizeError);
         }
         // We know `len` fits in an `i32`, so either:
@@ -43,7 +48,7 @@ impl Blob<'_> {
         //    losslessly converted to i32, since `len` came from an i32.
         // Sanity check the above.
         debug_assert!(i32::try_from(write_start).is_ok() && i32::try_from(buf.len()).is_ok());
-        self.conn.decode_result(unsafe {
+        self.decode_io_result(unsafe {
             ffi::sqlite3_blob_write(
                 self.blob,
                 buf.as_ptr().cast(),
@@ -107,6 +112,7 @@ impl Blob<'_> {
         buf: &'a mut [MaybeUninit<u8>],
         read_start: usize,
     ) -> Result<&'a mut [u8]> {
+        self.check_valid()?;
         let len = self.len();
 
         let read_len = match len.checked_sub(read_start) {
@@ -115,6 +121,10 @@ impl Blob<'_> {
         };
 
         if read_len == 0 {
+            // This path returns without calling into SQLite, so check for an
+            // invalidated handle explicitly: its `SQLITE_ABORT` takes
+            // precedence over the empty read.
+            self.probe_validity()?;
             // We could return `Ok(&mut [])`, but it seems confusing that the
             // pointers don't match, so fabricate an empty slice of u8 with the
             // same base pointer as `buf`.
@@ -149,7 +159,7 @@ impl Blob<'_> {
         debug_assert!(i32::try_from(read_len).is_ok());
 
         unsafe {
-            self.conn.decode_result(ffi::sqlite3_blob_read(
+            self.decode_io_result(ffi::sqlite3_blob_read(
                 self.blob,
                 buf.as_mut_ptr().cast(),
                 read_len as i32,
