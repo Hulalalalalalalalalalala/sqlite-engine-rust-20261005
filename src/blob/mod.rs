@@ -186,13 +186,15 @@
 //! # Ok(())
 //! # }
 //! ```
+use std::cell::Cell;
 use std::cmp::min;
+use std::ffi::c_int;
 use std::io;
 use std::ptr;
 
 use super::ffi;
 use super::types::{ToSql, ToSqlOutput};
-use crate::{Connection, Name, Result};
+use crate::{Connection, Error, Name, Result};
 
 mod pos_io;
 
@@ -203,6 +205,12 @@ pub struct Blob<'conn> {
     blob: *mut ffi::sqlite3_blob,
     // used by std::io implementations,
     pos: i32,
+    // Set once the handle has been invalidated: a failed `reopen`, or an
+    // I/O call that reported `SQLITE_ABORT` (which is how SQLite reacts to
+    // the underlying row being updated or deleted). Once set, every I/O
+    // operation must report `SQLITE_ABORT` instead of a result derived
+    // from the (now meaningless) cached blob size.
+    poisoned: Cell<bool>,
 }
 
 impl Connection {
@@ -243,6 +251,7 @@ impl Connection {
             conn: self,
             blob,
             pos: 0,
+            poisoned: Cell::new(false),
         })
     }
 }
@@ -253,10 +262,16 @@ impl Blob<'_> {
     /// # Failure
     ///
     /// Will return `Err` if the underlying SQLite BLOB reopen call fails.
+    /// Note that a failed `reopen` invalidates the handle: all subsequent
+    /// I/O on it will fail with `SQLITE_ABORT`.
     #[inline]
     pub fn reopen(&mut self, row: i64) -> Result<()> {
         let rc = unsafe { ffi::sqlite3_blob_reopen(self.blob, row) };
         if rc != ffi::SQLITE_OK {
+            // SQLite aborts the handle when the reopen fails, so remember
+            // that to report `SQLITE_ABORT` (rather than, say, an empty
+            // read) from every subsequent I/O operation.
+            self.poisoned.set(true);
             return self.conn.decode_result(rc);
         }
         self.pos = 0;
@@ -304,6 +319,49 @@ impl Blob<'_> {
         self.blob = ptr::null_mut();
         self.conn.decode_result(rc)
     }
+
+    /// Verify that the handle is still usable, returning the `SQLITE_ABORT`
+    /// error reported by SQLite if it has been invalidated (by a failed
+    /// [`Blob::reopen`], or by the row being updated or deleted).
+    ///
+    /// This only checks the cached invalidation state; use
+    /// [`Blob::probe_valid`] on code paths that would otherwise return
+    /// without performing any SQLite call.
+    #[inline]
+    fn check_valid(&self) -> Result<()> {
+        if self.poisoned.get() {
+            self.probe_valid()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Probe the handle with a zero-length read: SQLite reports
+    /// `SQLITE_ABORT` for an invalidated handle and `SQLITE_OK` for a live
+    /// one, without modifying any data or the stream position. This is how
+    /// operations that would otherwise not touch SQLite (reading at the end
+    /// of the blob, empty buffers, out-of-range positional writes) still
+    /// surface handle invalidation.
+    #[cold]
+    fn probe_valid(&self) -> Result<()> {
+        let mut byte = 0u8;
+        let rc = unsafe { ffi::sqlite3_blob_read(self.blob, (&raw mut byte).cast(), 0, 0) };
+        self.decode_io_result(rc)
+    }
+
+    /// Decode the result of a blob I/O call, remembering if the handle
+    /// became invalidated (`SQLITE_ABORT`) so that later calls keep
+    /// reporting that error instead of results based on a stale size.
+    #[inline]
+    fn decode_io_result(&self, rc: c_int) -> Result<()> {
+        let res = self.conn.decode_result(rc);
+        if let Err(Error::SqliteFailure(ref e, _)) = res
+            && e.code == ffi::ErrorCode::OperationAborted
+        {
+            self.poisoned.set(true);
+        }
+        res
+    }
 }
 
 impl io::Read for Blob<'_> {
@@ -315,14 +373,17 @@ impl io::Read for Blob<'_> {
     /// Will return `Err` if the underlying SQLite read call fails.
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.check_valid().map_err(io::Error::other)?;
         let max_allowed_len = (self.size() - self.pos) as usize;
         let n = min(buf.len(), max_allowed_len) as i32;
         if n <= 0 {
+            // Nothing to read, but still surface `SQLITE_ABORT` if the
+            // handle was invalidated.
+            self.probe_valid().map_err(io::Error::other)?;
             return Ok(0);
         }
         let rc = unsafe { ffi::sqlite3_blob_read(self.blob, buf.as_mut_ptr().cast(), n, self.pos) };
-        self.conn
-            .decode_result(rc)
+        self.decode_io_result(rc)
             .map(|()| {
                 self.pos += n;
                 n as usize
@@ -345,14 +406,17 @@ impl io::Write for Blob<'_> {
     /// Will return `Err` if the underlying SQLite write call fails.
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check_valid().map_err(io::Error::other)?;
         let max_allowed_len = (self.size() - self.pos) as usize;
         let n = min(buf.len(), max_allowed_len) as i32;
         if n <= 0 {
+            // Nothing to write, but still surface `SQLITE_ABORT` if the
+            // handle was invalidated.
+            self.probe_valid().map_err(io::Error::other)?;
             return Ok(0);
         }
         let rc = unsafe { ffi::sqlite3_blob_write(self.blob, buf.as_ptr() as *mut _, n, self.pos) };
-        self.conn
-            .decode_result(rc)
+        self.decode_io_result(rc)
             .map(|()| {
                 self.pos += n;
                 n as usize
@@ -559,6 +623,203 @@ mod test {
         use crate::types::ToSql as _;
         let zb = super::ZeroBlob(1);
         assert!(zb.to_sql().is_ok());
+        Ok(())
+    }
+
+    fn expect_abort<T: std::fmt::Debug>(res: Result<T>) {
+        match res {
+            Err(crate::Error::SqliteFailure(ref e, _))
+                if e.code == crate::ffi::ErrorCode::OperationAborted => {}
+            other => panic!("expected SQLITE_ABORT error, got {other:?}"),
+        }
+    }
+
+    fn expect_io_abort<T: std::fmt::Debug>(res: std::io::Result<T>) {
+        let err = res.expect_err("expected I/O error");
+        let inner = err
+            .downcast::<crate::Error>()
+            .expect("io::Error should wrap a rusqlite::Error");
+        assert_eq!(
+            inner.sqlite_error_code(),
+            Some(crate::ffi::ErrorCode::OperationAborted),
+            "expected SQLITE_ABORT, got {inner:?}"
+        );
+    }
+
+    #[test]
+    fn test_blob_invalidated_by_failed_reopen() -> Result<()> {
+        let (db, rowid) = db_with_test_blob()?;
+        let mut blob = db.blob_open(MAIN_DB, c"test", c"content", rowid, false)?;
+        blob.write_all(b"0123456789").unwrap();
+
+        // Reopening a row that does not exist returns the original SQLite
+        // error (SQLITE_ERROR), and invalidates the handle.
+        let err = blob.reopen(rowid + 100).unwrap_err();
+        assert_eq!(
+            err.sqlite_error_code(),
+            Some(crate::ffi::ErrorCode::Unknown)
+        );
+
+        // Every subsequent I/O operation reports SQLITE_ABORT, on the first
+        // and on later calls alike.
+        let mut buf = [0xAAu8; 4];
+        expect_io_abort(blob.read(&mut buf));
+        assert_eq!(&buf, &[0xAAu8; 4], "buffer must be untouched");
+        expect_io_abort(blob.read(&mut buf));
+        expect_io_abort(blob.write(b"xy"));
+        expect_abort(blob.read_at(&mut buf, 0));
+        expect_abort(blob.read_at_exact(&mut buf, 0));
+        expect_abort(blob.write_at(b"xy", 0));
+        expect_abort(blob.write_all_at(b"xy", 0));
+        let mut uninit = [std::mem::MaybeUninit::uninit(); 4];
+        expect_abort(blob.raw_read_at(&mut uninit, 0));
+        expect_abort(blob.raw_read_at_exact(&mut uninit, 0));
+
+        // The handle cannot be resurrected by reopening the original row.
+        blob.reopen(rowid).unwrap_err();
+
+        // Closing works, and a fresh handle on the same connection is fine.
+        blob.close()?;
+        let mut blob = db.blob_open(MAIN_DB, c"test", c"content", rowid, false)?;
+        let mut buf = [0u8; 10];
+        blob.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"0123456789");
+        Ok(())
+    }
+
+    #[test]
+    fn test_blob_invalidated_by_reopen_to_non_blob() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE t (content);
+             INSERT INTO t VALUES (ZEROBLOB(8));
+             INSERT INTO t VALUES (42);",
+        )?;
+        let mut blob = db.blob_open(MAIN_DB, c"t", c"content", 1, false)?;
+        // The target column of the new row is not a BLOB/TEXT: the reopen
+        // fails with the original error and invalidates the handle.
+        let err = blob.reopen(2).unwrap_err();
+        assert_eq!(
+            err.sqlite_error_code(),
+            Some(crate::ffi::ErrorCode::Unknown)
+        );
+        expect_io_abort(blob.read(&mut [0u8; 4]));
+        expect_abort(blob.read_at(&mut [0u8; 4], 0));
+        expect_io_abort(blob.write(b"xy"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_blob_invalidated_by_row_update_or_delete() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE t (content BLOB, other TEXT);")?;
+        db.execute("INSERT INTO t VALUES (ZEROBLOB(10), 'a')", [])?;
+        let rowid = db.last_insert_rowid();
+
+        // Updating even an unrelated column of the row invalidates the handle.
+        let mut blob = db.blob_open(MAIN_DB, c"t", c"content", rowid, false)?;
+        blob.write_all(b"0123456789").unwrap();
+        db.execute("UPDATE t SET other = 'b' WHERE rowid = ?1", [rowid])?;
+        let mut buf = [0u8; 10];
+        expect_io_abort(blob.read(&mut buf));
+        // Subsequent calls keep failing the same way.
+        expect_io_abort(blob.read(&mut buf));
+        expect_abort(blob.read_at(&mut buf, 0));
+        expect_abort(blob.write_at(b"zz", 0));
+        blob.close()?;
+
+        // Deleting the row invalidates the handle too.
+        let mut blob = db.blob_open(MAIN_DB, c"t", c"content", rowid, false)?;
+        db.execute("DELETE FROM t WHERE rowid = ?1", [rowid])?;
+        expect_io_abort(blob.write(b"zz"));
+        expect_io_abort(blob.read(&mut buf));
+        expect_abort(blob.read_at_exact(&mut buf, 0));
+        blob.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_blob_invalidation_short_circuit_paths() -> Result<()> {
+        // Each of these operations would, on a valid handle, return without
+        // calling into SQLite; on an invalidated handle they must all report
+        // SQLITE_ABORT instead of an empty result or a BlobSizeError.
+        for case in 0..8 {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch(
+                "CREATE TABLE t (content BLOB);
+                 INSERT INTO t VALUES (ZEROBLOB(10));",
+            )?;
+            let rowid = db.last_insert_rowid();
+            let mut blob = db.blob_open(MAIN_DB, c"t", c"content", rowid, false)?;
+            if case == 0 || case == 5 {
+                blob.seek(SeekFrom::End(0)).unwrap();
+            }
+            db.execute("DELETE FROM t WHERE rowid = ?1", [rowid])?;
+            let mut buf = [0u8; 4];
+            match case {
+                0 => expect_io_abort(blob.read(&mut buf)), // at end of stream
+                1 => expect_io_abort(blob.read(&mut [])),  // empty buffer
+                2 => expect_abort(blob.read_at(&mut buf, 10)), // offset past end
+                3 => expect_abort(blob.read_at(&mut buf, usize::MAX)), // huge offset
+                4 => expect_abort(blob.read_at_exact(&mut buf, 12)), // exact, past end
+                5 => expect_io_abort(blob.write(b"ab")),   // write at end
+                6 => expect_abort(blob.write_at(b"abcdef", 8)), // out-of-range write
+                7 => expect_abort(blob.write_at(b"ab", usize::MAX)), // huge offset write
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_blob_invalidation_inside_transaction() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE t (content BLOB, other TEXT);")?;
+        db.execute("INSERT INTO t VALUES (ZEROBLOB(10), 'a')", [])?;
+        let rowid = db.last_insert_rowid();
+
+        let tx = db.transaction()?;
+        tx.execute("INSERT INTO t VALUES (ZEROBLOB(4), 'b')", [])?;
+        let mut blob = tx.blob_open(MAIN_DB, c"t", c"content", rowid, false)?;
+        tx.execute("UPDATE t SET other = 'c' WHERE rowid = ?1", [rowid])?;
+        let mut buf = [0u8; 4];
+        expect_io_abort(blob.read(&mut buf));
+        blob.close()?;
+        // The I/O error must not have committed or rolled back the caller's
+        // transaction; the caller decides what happens to its changes.
+        tx.rollback()?;
+
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))?;
+        assert_eq!(count, 1);
+        let other: String =
+            db.query_row("SELECT other FROM t WHERE rowid = ?1", [rowid], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(other, "a");
+        Ok(())
+    }
+
+    #[test]
+    fn test_zero_length_blob_unaffected() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE t (content BLOB);
+             INSERT INTO t VALUES (ZEROBLOB(0));",
+        )?;
+        let rowid = db.last_insert_rowid();
+        let mut blob = db.blob_open(MAIN_DB, c"t", c"content", rowid, false)?;
+        assert!(blob.is_empty());
+        // A genuine zero-length BLOB still yields empty results, not
+        // invalidation errors.
+        let mut buf = [0u8; 4];
+        assert_eq!(blob.read(&mut buf).unwrap(), 0);
+        assert_eq!(blob.write(b"ab").unwrap(), 0);
+        assert_eq!(blob.read_at(&mut buf, 0)?, 0);
+        blob.read_at_exact(&mut [], 0)?;
+        blob.write_at(&[], 0)?;
+        let mut uninit = [std::mem::MaybeUninit::<u8>::uninit(); 2];
+        assert_eq!(blob.raw_read_at(&mut uninit, 0)?.len(), 0);
+        blob.raw_read_at_exact(&mut [], 0)?;
         Ok(())
     }
 }
