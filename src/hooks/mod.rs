@@ -3,10 +3,11 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::panic::catch_unwind;
+use std::sync::{Arc, Mutex};
 
 use crate::ffi;
 
-use crate::{Connection, InnerConnection, Result, error::decode_result_raw};
+use crate::{Connection, Error, InnerConnection, Result, error::decode_result_raw};
 
 #[cfg(feature = "preupdate_hook")]
 pub use preupdate_hook::*;
@@ -352,6 +353,37 @@ impl Connection {
     }
 
     /// Register a callback function to be invoked whenever
+    /// a transaction is committed, with the ability to fail the commit
+    /// with a specific error.
+    ///
+    /// The callback returns:
+    ///
+    /// - `Ok(false)` to allow the commit,
+    /// - `Ok(true)` to rollback, exactly like a [`commit_hook`](Connection::commit_hook)
+    ///   callback returning `true`,
+    /// - `Err(e)` to rollback and make the operation that triggered the
+    ///   commit (e.g. [`Transaction::commit`](crate::Transaction::commit),
+    ///   [`execute`](Connection::execute) of an auto-commit write, or
+    ///   iterating an `INSERT ... RETURNING` to completion) fail with `e`,
+    ///   preserved as-is.
+    ///
+    /// A panic unwinding out of the callback is caught before it can cross
+    /// the SQLite call boundary; the commit is rolled back and the triggering
+    /// operation fails with [`Error::UnwindingPanic`](crate::Error::UnwindingPanic).
+    ///
+    /// This shares a single registration with [`commit_hook`](Connection::commit_hook):
+    /// registering either one replaces the other, and passing `None` to
+    /// either unregisters the current hook. A rejection does not unregister
+    /// the callback.
+    #[inline]
+    pub fn try_commit_hook<F>(&mut self, hook: Option<F>) -> Result<()>
+    where
+        F: FnMut() -> Result<bool> + Send + 'static,
+    {
+        self.db.borrow_mut().try_commit_hook(hook)
+    }
+
+    /// Register a callback function to be invoked whenever
     /// a transaction is rolled back.
     #[inline]
     pub fn rollback_hook<F>(&mut self, hook: Option<F>) -> Result<()>
@@ -503,6 +535,15 @@ impl Wal {
     }
 }
 
+/// Registration payload for [`Connection::try_commit_hook`]: the user
+/// callback plus the side channel used to pass the rejection reason back to
+/// the connection, since the SQLite commit-hook callback can only return an
+/// integer.
+struct TryCommitHook<F> {
+    hook: F,
+    error: Arc<Mutex<Option<Error>>>,
+}
+
 impl InnerConnection {
     /// ```compile_fail
     /// use rusqlite::{Connection, Result};
@@ -546,6 +587,68 @@ impl InnerConnection {
             ffi::sqlite3_commit_hook(db, x, bh);
             ffi::SQLITE_OK
         })?;
+        // The plain hook cannot report a reason; drop the side channel a
+        // replaced `try_commit_hook` may have shared with this connection.
+        self.set_commit_hook_error_slot(None);
+        Ok(())
+    }
+
+    /// ```compile_fail
+    /// use rusqlite::{Connection, Result};
+    /// fn main() -> Result<()> {
+    ///     let mut db = Connection::open_in_memory()?;
+    ///     {
+    ///         let mut called = std::sync::atomic::AtomicBool::new(false);
+    ///         db.try_commit_hook(Some(|| {
+    ///             called.store(true, std::sync::atomic::Ordering::Relaxed);
+    ///             Ok(true)
+    ///         }));
+    ///     }
+    ///     assert!(db
+    ///         .execute_batch(
+    ///             "BEGIN;
+    ///         CREATE TABLE foo (t TEXT);
+    ///         COMMIT;",
+    ///         )
+    ///         .is_err());
+    ///     Ok(())
+    /// }
+    /// ```
+    fn try_commit_hook<F>(&mut self, hook: Option<F>) -> Result<()>
+    where
+        F: FnMut() -> Result<bool> + Send + 'static,
+    {
+        unsafe extern "C" fn call_boxed_closure<F>(p_arg: *mut c_void) -> c_int
+        where
+            F: FnMut() -> Result<bool>,
+        {
+            unsafe {
+                let r = catch_unwind(|| {
+                    let state: *mut TryCommitHook<F> = p_arg.cast::<TryCommitHook<F>>();
+                    ((*state).hook)()
+                });
+                let err = match r {
+                    Ok(Ok(rollback)) => return c_int::from(rollback),
+                    Ok(Err(err)) => err,
+                    // Do not let the panic cross the SQLite call boundary.
+                    Err(_) => Error::UnwindingPanic,
+                };
+                let state: *mut TryCommitHook<F> = p_arg.cast::<TryCommitHook<F>>();
+                *(*state).error.lock().unwrap() = Some(err);
+                1
+            }
+        }
+        let error = Arc::new(Mutex::new(None));
+        let registration = hook.map(|hook| TryCommitHook {
+            hook,
+            error: Arc::clone(&error),
+        });
+        let x = registration.as_ref().map(|_| call_boxed_closure::<F> as _);
+        self.set_clientdata(c"sqlite3_commit_hook", registration, |db, bh| unsafe {
+            ffi::sqlite3_commit_hook(db, x, bh);
+            ffi::SQLITE_OK
+        })?;
+        self.set_commit_hook_error_slot(x.map(|_| error));
         Ok(())
     }
 
@@ -778,7 +881,7 @@ mod test {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use super::{Action, Wal};
-    use crate::{Connection, MAIN_DB, Result};
+    use crate::{Connection, Error, MAIN_DB, Result};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -792,6 +895,497 @@ mod test {
         }))?;
         db.execute_batch("BEGIN; CREATE TABLE foo (t TEXT); COMMIT;")?;
         assert!(CALLED.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_allow() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+
+        static CALLED: AtomicBool = AtomicBool::new(false);
+        db.try_commit_hook(Some(|| -> Result<bool> {
+            CALLED.store(true, Ordering::Relaxed);
+            Ok(false)
+        }))?;
+        db.execute_batch("BEGIN; CREATE TABLE foo (t TEXT); COMMIT;")?;
+        assert!(CALLED.load(Ordering::Relaxed));
+        assert_eq!(
+            1,
+            db.one_column::<i64, _>("SELECT COUNT(*) FROM sqlite_master WHERE name = 'foo'", [])?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_deny_like_commit_hook() -> Result<()> {
+        fn denied_with_old_hook() -> Error {
+            let mut db = Connection::open_in_memory().unwrap();
+            db.execute_batch("CREATE TABLE foo (t TEXT)").unwrap();
+            db.commit_hook(Some(|| true)).unwrap();
+            db.execute_batch("BEGIN; INSERT INTO foo VALUES ('x'); COMMIT;")
+                .unwrap_err()
+        }
+        fn denied_with_try_hook() -> Error {
+            let mut db = Connection::open_in_memory().unwrap();
+            db.execute_batch("CREATE TABLE foo (t TEXT)").unwrap();
+            db.try_commit_hook(Some(|| -> Result<bool> { Ok(true) }))
+                .unwrap();
+            db.execute_batch("BEGIN; INSERT INTO foo VALUES ('x'); COMMIT;")
+                .unwrap_err()
+        }
+        // `Ok(true)` rejects exactly like a `commit_hook` returning `true`
+        assert_eq!(denied_with_old_hook(), denied_with_try_hook());
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_error_reason() -> Result<()> {
+        #[derive(Debug)]
+        struct Custom(&'static str);
+        impl std::fmt::Display for Custom {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Custom {}
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        db.try_commit_hook(Some(|| -> Result<bool> {
+            Err(Error::ToSqlConversionFailure(Box::new(Custom("denied"))))
+        }))?;
+
+        let err = db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+        // the exact error is reported: variant, content and the concrete
+        // type of the contained error object are preserved
+        match &err {
+            Error::ToSqlConversionFailure(inner) => {
+                let custom = inner.downcast_ref::<Custom>().expect("concrete type");
+                assert_eq!("denied", custom.0);
+            }
+            _ => panic!("expected the hook's error, got {err:?}"),
+        }
+        // the write was rolled back and the connection is usable
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_panic() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        db.try_commit_hook(Some(|| -> Result<bool> { panic!("boom") }))?;
+        let err = db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+        assert_eq!(Error::UnwindingPanic, err);
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_transaction_commit() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::InvalidParameterName("nope".to_owned()))
+            }))?;
+        }
+        let err = {
+            let tx = db.transaction()?;
+            tx.execute("INSERT INTO foo VALUES (1)", [])?;
+            tx.commit().unwrap_err()
+        };
+        assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        // the check ran exactly once: dropping the transaction afterwards did
+        // not run it again
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_finish_commit() -> Result<()> {
+        use crate::transaction::DropBehavior;
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        db.try_commit_hook(Some(|| -> Result<bool> {
+            Err(Error::InvalidParameterName("nope".to_owned()))
+        }))?;
+        let err = {
+            let mut tx = db.transaction()?;
+            tx.execute("INSERT INTO foo VALUES (1)", [])?;
+            tx.set_drop_behavior(DropBehavior::Commit);
+            tx.finish().unwrap_err()
+        };
+        assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_drop_commit_no_leak() -> Result<()> {
+        use crate::transaction::DropBehavior;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            // reject only the first commit attempted
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Error::InvalidParameterName("nope".to_owned()))
+                } else {
+                    Ok(false)
+                }
+            }))?;
+        }
+        {
+            let mut tx = db.transaction()?;
+            tx.execute("INSERT INTO foo VALUES (1)", [])?;
+            tx.set_drop_behavior(DropBehavior::Commit);
+            // the commit is attempted (and rejected) while dropping, where no
+            // error can be returned
+        }
+        // the writes were still rolled back
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+        // the swallowed error does not pop out of the next unrelated
+        // operation, and the hook is still registered
+        db.execute("INSERT INTO foo VALUES (2)", [])?;
+        assert_eq!(2, calls.load(Ordering::SeqCst));
+        assert_eq!(1, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_savepoint_release() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        db.try_commit_hook(Some(|| -> Result<bool> {
+            Err(Error::InvalidParameterName("nope".to_owned()))
+        }))?;
+        let err = {
+            let sp = db.savepoint()?;
+            sp.execute("INSERT INTO foo VALUES (1)", [])?;
+            // releasing the outermost savepoint commits the transaction
+            sp.commit().unwrap_err()
+        };
+        assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_nested_savepoint() -> Result<()> {
+        use crate::transaction::DropBehavior;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::InvalidParameterName("nope".to_owned()))
+            }))?;
+        }
+        let mut tx = db.transaction()?;
+        tx.execute("INSERT INTO foo VALUES (1)", [])?;
+        {
+            let mut sp = tx.savepoint()?;
+            sp.execute("INSERT INTO foo VALUES (2)", [])?;
+            sp.set_drop_behavior(DropBehavior::Commit);
+            // releasing a nested savepoint must not run the check
+        }
+        assert_eq!(0, calls.load(Ordering::SeqCst));
+        let err = tx.commit().unwrap_err();
+        assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+        // the writes made in the released savepoint are rolled back too
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_execute_batch_stops() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            // reject only the second commit
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    Err(Error::InvalidParameterName("nope".to_owned()))
+                } else {
+                    Ok(false)
+                }
+            }))?;
+        }
+        let err = db
+            .execute_batch("INSERT INTO foo VALUES (1); INSERT INTO foo VALUES (2); INSERT INTO foo VALUES (3);")
+            .unwrap_err();
+        assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        // the batch stopped at the rejection: the third statement never ran,
+        // but the first, already committed transaction stays
+        assert_eq!(2, calls.load(Ordering::SeqCst));
+        assert_eq!(1, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_returning() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        db.try_commit_hook(Some(|| -> Result<bool> {
+            Err(Error::InvalidParameterName("nope".to_owned()))
+        }))?;
+        let mut stmt = db.prepare("INSERT INTO foo VALUES (1) RETURNING x")?;
+        let mut rows = stmt.query([])?;
+        // a returned row is not a committed row
+        assert!(rows.next()?.is_some());
+        let err = rows.next().unwrap_err();
+        assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        drop(rows);
+        drop(stmt);
+        assert!(db.is_autocommit());
+        assert_eq!(0, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_statement_reuse() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            // reject only the first commit
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Error::InvalidParameterName("nope".to_owned()))
+                } else {
+                    Ok(false)
+                }
+            }))?;
+        }
+        let mut stmt = db.prepare("INSERT INTO foo VALUES (1)")?;
+        let err = stmt.execute([]).unwrap_err();
+        assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        // the failed statement can be executed again
+        stmt.execute([])?;
+        drop(stmt);
+        assert_eq!(1, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[cfg(feature = "cache")]
+    #[test]
+    fn test_try_commit_hook_cached_statement() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            // reject only the first commit
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Error::InvalidParameterName("nope".to_owned()))
+                } else {
+                    Ok(false)
+                }
+            }))?;
+        }
+        {
+            let mut stmt = db.prepare_cached("INSERT INTO foo VALUES (1)")?;
+            let err = stmt.execute([]).unwrap_err();
+            assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        }
+        {
+            // the statement handed back to the cache carries no old error
+            let mut stmt = db.prepare_cached("INSERT INTO foo VALUES (1)")?;
+            stmt.execute([])?;
+        }
+        assert_eq!(1, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[cfg_attr(
+        all(target_family = "wasm", target_os = "unknown"),
+        ignore = "no filesystem on this platform"
+    )]
+    #[test]
+    fn test_try_commit_hook_other_connection() -> Result<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("try-commit-hook.db3");
+        let mut db1 = Connection::open(&path)?;
+        db1.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let db2 = Connection::open(&path)?;
+
+        db1.try_commit_hook(Some(|| -> Result<bool> {
+            Err(Error::InvalidParameterName("nope".to_owned()))
+        }))?;
+        let err = db1.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+        assert_eq!(Error::InvalidParameterName("nope".to_owned()), err);
+        // the other connection never saw the rolled-back write and is not
+        // affected by the error
+        assert_eq!(0, db2.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        db2.execute("INSERT INTO foo VALUES (2)", [])?;
+        assert_eq!(1, db2.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_commit_hook_not_unregistered_by_failure() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            // reject only the first commit
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Error::InvalidParameterName("nope".to_owned()))
+                } else {
+                    Ok(false)
+                }
+            }))?;
+        }
+        db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+        // a failed check does not unregister the callback
+        db.execute("INSERT INTO foo VALUES (2)", [])?;
+        assert_eq!(2, calls.load(Ordering::SeqCst));
+        assert_eq!(1, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_hooks_share_registration() -> Result<()> {
+        use std::sync::atomic::AtomicUsize;
+
+        static OLD_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static NEW_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+
+        // the newer registration replaces the older one, either way
+        db.commit_hook(Some(|| {
+            OLD_CALLS.fetch_add(1, Ordering::SeqCst);
+            false
+        }))?;
+        db.try_commit_hook(Some(|| -> Result<bool> {
+            NEW_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }))?;
+        db.execute("INSERT INTO foo VALUES (1)", [])?;
+        assert_eq!(0, OLD_CALLS.load(Ordering::SeqCst));
+        assert_eq!(1, NEW_CALLS.load(Ordering::SeqCst));
+
+        db.commit_hook(Some(|| {
+            OLD_CALLS.fetch_add(1, Ordering::SeqCst);
+            false
+        }))?;
+        db.execute("INSERT INTO foo VALUES (2)", [])?;
+        assert_eq!(1, OLD_CALLS.load(Ordering::SeqCst));
+        assert_eq!(1, NEW_CALLS.load(Ordering::SeqCst));
+
+        // either entry point unregisters the current hook
+        db.try_commit_hook(None::<fn() -> Result<bool>>)?;
+        db.execute("INSERT INTO foo VALUES (3)", [])?;
+        assert_eq!(1, OLD_CALLS.load(Ordering::SeqCst));
+        assert_eq!(1, NEW_CALLS.load(Ordering::SeqCst));
+
+        db.try_commit_hook(Some(|| -> Result<bool> {
+            NEW_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }))?;
+        db.commit_hook(None::<fn() -> bool>)?;
+        db.execute("INSERT INTO foo VALUES (4)", [])?;
+        assert_eq!(1, OLD_CALLS.load(Ordering::SeqCst));
+        assert_eq!(1, NEW_CALLS.load(Ordering::SeqCst));
+
+        assert_eq!(4, db.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_hooks_dropped_exactly_once() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        struct DropCounter(Arc<AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut db = Connection::open_in_memory()?;
+
+        {
+            let counter = DropCounter(Arc::clone(&drops));
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                let _ = &counter;
+                Ok(false)
+            }))?;
+        }
+        // replaced by the other entry point: released exactly once
+        {
+            let counter = DropCounter(Arc::clone(&drops));
+            db.commit_hook(Some(move || {
+                let _ = &counter;
+                false
+            }))?;
+            assert_eq!(1, drops.load(Ordering::SeqCst));
+        }
+        // unregistered through either entry point: released exactly once
+        db.try_commit_hook(None::<fn() -> Result<bool>>)?;
+        assert_eq!(2, drops.load(Ordering::SeqCst));
+
+        // released exactly once when the connection is closed
+        {
+            let counter = DropCounter(Arc::clone(&drops));
+            db.try_commit_hook(Some(move || -> Result<bool> {
+                let _ = &counter;
+                Ok(false)
+            }))?;
+        }
+        assert_eq!(2, drops.load(Ordering::SeqCst));
+        drop(db);
+        assert_eq!(3, drops.load(Ordering::SeqCst));
         Ok(())
     }
 

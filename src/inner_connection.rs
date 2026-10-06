@@ -21,6 +21,13 @@ pub struct InnerConnection {
     // Otherwise, a long-running query would prevent calling interrupt, as
     // interrupt would only acquire the lock after the query's completion.
     interrupt_lock: Arc<Mutex<*mut ffi::sqlite3>>,
+    // Side channel used by `try_commit_hook` to smuggle the rejection reason
+    // out of the SQLite commit-hook callback (which can only return an
+    // integer). Shared with the registered callback; populated only while a
+    // commit is being rejected, and consumed by the first `decode_result`
+    // that sees the resulting SQLite error.
+    #[cfg(feature = "hooks")]
+    commit_hook_error: Option<Arc<Mutex<Option<Error>>>>,
     owned: bool,
 }
 
@@ -33,6 +40,8 @@ impl InnerConnection {
         Self {
             db,
             interrupt_lock: Arc::new(Mutex::new(if owned { db } else { ptr::null_mut() })),
+            #[cfg(feature = "hooks")]
+            commit_hook_error: None,
             owned,
         }
     }
@@ -105,7 +114,25 @@ impl InnerConnection {
 
     #[inline]
     pub fn decode_result(&self, code: c_int) -> Result<()> {
+        // A `try_commit_hook` rejection makes the SQLite call that triggered
+        // the commit fail; report the hook's reason instead of the generic
+        // SQLite error. The slot is populated only between the rejection and
+        // this decode, so taking it here cannot affect unrelated operations.
+        #[cfg(feature = "hooks")]
+        if code != ffi::SQLITE_OK
+            && let Some(slot) = &self.commit_hook_error
+            && let Some(err) = slot.lock().unwrap().take()
+        {
+            return Err(err);
+        }
         unsafe { decode_result_raw(self.db(), code) }
+    }
+
+    /// Share (or clear, with `None`) the side channel the current
+    /// `try_commit_hook` callback uses to report the reason of a rejection.
+    #[cfg(feature = "hooks")]
+    pub(crate) fn set_commit_hook_error_slot(&mut self, slot: Option<Arc<Mutex<Option<Error>>>>) {
+        self.commit_hook_error = slot;
     }
 
     pub fn close(&mut self) -> Result<()> {
