@@ -462,6 +462,11 @@ macro_rules! err {
 
 #[cold]
 pub unsafe fn error_from_handle(db: *mut ffi::sqlite3, code: c_int) -> Error {
+    // A commit rejected by a `try_commit_hook` carries its own reason.
+    #[cfg(feature = "hooks")]
+    if let Some(err) = unsafe { crate::hooks::take_try_commit_hook_error(db, code) } {
+        return err;
+    }
     error_from_sqlite_code(code, unsafe { error_msg(db, code) })
 }
 
