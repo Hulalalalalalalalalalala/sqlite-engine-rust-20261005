@@ -473,6 +473,12 @@ pub unsafe fn error_from_handle(db: *mut ffi::sqlite3, code: c_int) -> Error {
     if let Some(err) = unsafe { crate::hooks::take_wal_hook_error(db, code) } {
         return err;
     }
+    // Access denied by a `try_authorizer` surfaces as `SQLITE_AUTH`; the
+    // authorizer's own error is the real reason.
+    #[cfg(feature = "hooks")]
+    if let Some(err) = unsafe { crate::hooks::take_try_authorizer_error(db, code) } {
+        return err;
+    }
     error_from_sqlite_code(code, unsafe { error_msg(db, code) })
 }
 
@@ -506,6 +512,11 @@ pub unsafe fn error_with_offset(db: *mut ffi::sqlite3, code: c_int, sql: &str) -
         if db.is_null() {
             error_from_sqlite_code(code, None)
         } else {
+            // Access denied by a `try_authorizer` carries its own reason.
+            #[cfg(feature = "hooks")]
+            if let Some(err) = crate::hooks::take_try_authorizer_error(db, code) {
+                return err;
+            }
             let error = ffi::Error::new(code);
             let msg = error_msg(db, code);
             if ffi::ErrorCode::Unknown == error.code {
