@@ -467,6 +467,16 @@ pub unsafe fn error_from_handle(db: *mut ffi::sqlite3, code: c_int) -> Error {
     if let Some(err) = unsafe { crate::hooks::take_try_commit_hook_error(db, code) } {
         return err;
     }
+    // A failed `wal_hook` notification makes SQLite report a generic
+    // `SQLITE_ERROR` for the call that triggered it; substitute the reason
+    // the hook provided. The write that triggered the notification was
+    // already committed and is not affected by the error.
+    #[cfg(feature = "hooks")]
+    if code == ffi::SQLITE_ERROR
+        && let Some(err) = unsafe { crate::hooks::take_wal_hook_error(db) }
+    {
+        return err;
+    }
     error_from_sqlite_code(code, unsafe { error_msg(db, code) })
 }
 

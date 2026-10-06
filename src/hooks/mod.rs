@@ -413,40 +413,20 @@ impl Connection {
     /// Calling `wal_hook` replaces any previously registered write-ahead log callback.
     /// Note that the `sqlite3_wal_autocheckpoint()` interface and the `wal_autocheckpoint` pragma
     /// both invoke `sqlite3_wal_hook()` and will overwrite any prior `sqlite3_wal_hook()` settings.
+    ///
+    /// The callback is invoked after the write that triggered it has already
+    /// been committed. If it returns `Err(e)`, the database call that
+    /// triggered the notification fails with `e` — the error variant, its
+    /// message and any custom error it carries are preserved — but the
+    /// committed write is not rolled back or retried. If the callback
+    /// panics, the triggering call fails with [`Error::UnwindingPanic`].
+    /// Returning `Ok(())` lets the triggering call succeed. A failing
+    /// callback stays registered.
     pub fn wal_hook<F>(&mut self, hook: Option<F>) -> Result<()>
     where
         F: FnMut(&Wal, c_int) -> Result<()> + Send + 'static,
     {
-        unsafe extern "C" fn wal_hook_callback<F>(
-            client_data: *mut c_void,
-            db: *mut ffi::sqlite3,
-            db_name: *const c_char,
-            pages: c_int,
-        ) -> c_int
-        where
-            F: FnMut(&Wal, c_int) -> Result<()>,
-        {
-            unsafe {
-                let wal = Wal { db, db_name };
-                catch_unwind(|| {
-                    let hook_fn: *mut F = client_data.cast::<F>();
-                    match (*hook_fn)(&wal, pages) {
-                        Ok(()) => ffi::SQLITE_OK,
-                        Err(e) => e
-                            .sqlite_error()
-                            .map_or(ffi::SQLITE_ERROR, |x| x.extended_code),
-                    }
-                })
-                .unwrap_or_default()
-            }
-        }
-        let x = hook.as_ref().map(|_| wal_hook_callback::<F> as _);
-        let mut c = self.db.borrow_mut();
-        c.set_clientdata(c"sqlite3_wal_hook", hook, |db, bh| unsafe {
-            ffi::sqlite3_wal_hook(db, x, bh);
-            ffi::SQLITE_OK
-        })?;
-        Ok(())
+        self.db.borrow_mut().wal_hook(hook)
     }
 
     /// Register a query progress callback.
@@ -596,6 +576,72 @@ pub(crate) unsafe fn take_try_commit_hook_error(
     unsafe { (*state).error.take() }
 }
 
+/// The wal hook registered on a connection.
+struct WalHookState {
+    hook: WalHookFn,
+    /// The reason the hook failed the most recent notification, to be
+    /// reported by the database call that observes SQLite's generic
+    /// `SQLITE_ERROR`. Reset on every hook invocation, so a stale reason can
+    /// never be attributed to a later failure.
+    error: Option<Error>,
+}
+
+type WalHookFn = Box<dyn FnMut(&Wal, c_int) -> Result<()> + Send>;
+
+unsafe extern "C" fn wal_hook_callback(
+    client_data: *mut c_void,
+    db: *mut ffi::sqlite3,
+    db_name: *const c_char,
+    pages: c_int,
+) -> c_int {
+    unsafe {
+        let state: *mut WalHookState = client_data.cast();
+        let wal = Wal { db, db_name };
+        let r = catch_unwind(AssertUnwindSafe(|| ((*state).hook)(&wal, pages)));
+        let (code, error) = match r {
+            Ok(Ok(())) => (ffi::SQLITE_OK, None),
+            Ok(Err(err)) => {
+                // SQLite only forwards that the hook failed, not why: the
+                // call that triggered the notification reports a generic
+                // `SQLITE_ERROR` whatever code is returned here. Keep the
+                // hook's own code for SQLite's raw error state, but never
+                // report success for a failed notification.
+                let code = err
+                    .sqlite_error()
+                    .map_or(ffi::SQLITE_ERROR, |x| x.extended_code);
+                (
+                    if code == ffi::SQLITE_OK {
+                        ffi::SQLITE_ERROR
+                    } else {
+                        code
+                    },
+                    Some(err),
+                )
+            }
+            Err(_) => (ffi::SQLITE_ERROR, Some(Error::UnwindingPanic)),
+        };
+        (*state).error = error;
+        code
+    }
+}
+
+/// If the wal hook on `db` failed during the database call that is now
+/// being reported, take and return the reason it provided. The reason is
+/// consumed, so it is reported at most once, by the first call that
+/// observes the failure. The notification happens after the write has been
+/// committed, so the reason never implies the write was undone.
+pub(crate) unsafe fn take_wal_hook_error(db: *mut ffi::sqlite3) -> Option<Error> {
+    if db.is_null() {
+        return None;
+    }
+    let state = unsafe { ffi::sqlite3_get_clientdata(db, c"sqlite3_wal_hook".as_ptr()) }
+        .cast::<WalHookState>();
+    if state.is_null() {
+        return None;
+    }
+    unsafe { (*state).error.take() }
+}
+
 impl InnerConnection {
     /// ```compile_fail
     /// use rusqlite::{Connection, Result};
@@ -658,6 +704,37 @@ impl InnerConnection {
         let x = state.as_ref().map(|_| commit_hook_callback as _);
         self.set_clientdata(c"sqlite3_commit_hook", state, |db, bh| unsafe {
             ffi::sqlite3_commit_hook(db, x, bh);
+            ffi::SQLITE_OK
+        })?;
+        Ok(())
+    }
+
+    /// ```compile_fail
+    /// use rusqlite::{Connection, Result};
+    /// use rusqlite::hooks::Wal;
+    /// fn main() -> Result<()> {
+    ///     let mut db = Connection::open_in_memory()?;
+    ///     {
+    ///         let mut called = std::sync::atomic::AtomicBool::new(false);
+    ///         db.wal_hook(Some(|_: &Wal, _| {
+    ///             called.store(true, std::sync::atomic::Ordering::Relaxed);
+    ///             Ok(())
+    ///         }));
+    ///     }
+    ///     db.execute_batch("CREATE TABLE foo (t TEXT);")
+    /// }
+    /// ```
+    fn wal_hook<F>(&mut self, hook: Option<F>) -> Result<()>
+    where
+        F: FnMut(&Wal, c_int) -> Result<()> + Send + 'static,
+    {
+        let state = hook.map(|hook| WalHookState {
+            hook: Box::new(hook),
+            error: None,
+        });
+        let x = state.as_ref().map(|_| wal_hook_callback as _);
+        self.set_clientdata(c"sqlite3_wal_hook", state, |db, bh| unsafe {
+            ffi::sqlite3_wal_hook(db, x, bh);
             ffi::SQLITE_OK
         })?;
         Ok(())
@@ -1554,5 +1631,423 @@ mod test {
         db2.execute("INSERT INTO foo VALUES (3)", [])?;
         assert_eq!(1, db1.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
         Ok(())
+    }
+
+    #[derive(Debug)]
+    struct WalHookFailed(&'static str);
+
+    impl std::fmt::Display for WalHookFailed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for WalHookFailed {}
+
+    fn wal_err(msg: &'static str) -> Error {
+        Error::ToSqlConversionFailure(Box::new(WalHookFailed(msg)))
+    }
+
+    fn assert_wal_err(err: &Error, msg: &'static str) {
+        match err {
+            Error::ToSqlConversionFailure(e) => {
+                let we = e
+                    .downcast_ref::<WalHookFailed>()
+                    .expect("inner error type must be preserved");
+                assert_eq!(msg, we.0);
+            }
+            other => panic!("expected the hook's error, got {other:?}"),
+        }
+    }
+
+    fn wal_foo_db() -> Result<(tempfile::TempDir, Connection)> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("wal-hook-test.db3");
+        let db = Connection::open(&path)?;
+        let journal_mode: String =
+            db.pragma_update_and_check(None, "journal_mode", "wal", |row| row.get(0))?;
+        assert_eq!(journal_mode, "wal");
+        db.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+        Ok((temp_dir, db))
+    }
+
+    macro_rules! wal_file_test {
+        ($(#[$meta:meta])* fn $name:ident() -> Result<()> $body:block) => {
+            #[cfg_attr(
+                all(target_family = "wasm", target_os = "unknown"),
+                ignore = "no filesystem on this platform"
+            )]
+            $(#[$meta])*
+            fn $name() -> Result<()> $body
+        };
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_error_propagates() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            db.wal_hook(Some(|_: &Wal, _| Err(wal_err("wal notification failed"))))?;
+
+            let err = db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+            assert_wal_err(&err, "wal notification failed");
+            // the notification happens after the commit: the write stays and
+            // the connection is back in autocommit mode
+            assert!(db.is_autocommit());
+            assert_eq!(1, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_error_visible_to_other_connection() -> Result<()> {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let path = temp_dir.path().join("wal-hook-share.db3");
+            let mut db1 = Connection::open(&path)?;
+            let journal_mode: String =
+                db1.pragma_update_and_check(None, "journal_mode", "wal", |row| row.get(0))?;
+            assert_eq!(journal_mode, "wal");
+            db1.execute_batch("CREATE TABLE foo (x INTEGER)")?;
+            let db2 = Connection::open(&path)?;
+
+            db1.wal_hook(Some(|_: &Wal, _| Err(wal_err("wal notification failed"))))?;
+            let err = db1.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+            assert_wal_err(&err, "wal notification failed");
+            // a new reader on the same file sees the committed write
+            assert_eq!(1, db2.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+            // the other connection never receives db1's hook error
+            db2.execute("INSERT INTO foo VALUES (2)", [])?;
+            assert_eq!(2, db1.one_column::<i32, _>("SELECT COUNT(*) FROM foo", [])?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_panic() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            db.wal_hook(Some(|_: &Wal, _| -> Result<()> { panic!("boom") }))?;
+
+            let err = db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+            assert_eq!(Error::UnwindingPanic, err);
+            assert!(db.is_autocommit());
+            assert_eq!(1, foo_count(&db)?);
+
+            // the hook is still registered and still panics
+            let err = db.execute("INSERT INTO foo VALUES (2)", []).unwrap_err();
+            assert_eq!(Error::UnwindingPanic, err);
+            assert_eq!(2, foo_count(&db)?);
+
+            // removing it restores normal operation
+            db.wal_hook(None::<fn(&Wal, std::ffi::c_int) -> Result<()>>)?;
+            db.execute("INSERT INTO foo VALUES (3)", [])?;
+            assert_eq!(3, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_transaction_commit() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls2 = Arc::clone(&calls);
+            db.wal_hook(Some(move |_: &Wal, _| {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                Err(wal_err("wal notification failed"))
+            }))?;
+            let err = {
+                let tx = db.transaction()?;
+                tx.execute("INSERT INTO foo VALUES (1)", [])?;
+                tx.commit().unwrap_err()
+            };
+            assert_wal_err(&err, "wal notification failed");
+            // the notification ran exactly once: the failed call did not
+            // retry the commit, and dropping the transaction did not either
+            assert_eq!(1, calls.load(Ordering::SeqCst));
+            assert!(db.is_autocommit());
+            // the write was committed before the notification ran
+            assert_eq!(1, foo_count(&db)?);
+            // the connection can start a new transaction
+            db.transaction()?.commit()
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_savepoint_release() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            db.wal_hook(Some(|_: &Wal, _| Err(wal_err("wal notification failed"))))?;
+            // a savepoint started in autocommit mode commits on release
+            let err = {
+                let mut sp = db.savepoint()?;
+                sp.execute("INSERT INTO foo VALUES (1)", [])?;
+                sp.set_drop_behavior(DropBehavior::Commit);
+                sp.finish().unwrap_err()
+            };
+            assert_wal_err(&err, "wal notification failed");
+            assert!(db.is_autocommit());
+            assert_eq!(1, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_nested_savepoint() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls2 = Arc::clone(&calls);
+            db.wal_hook(Some(move |_: &Wal, _| {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))?;
+            let mut tx = db.transaction()?;
+            tx.execute("INSERT INTO foo VALUES (1)", [])?;
+            {
+                let sp = tx.savepoint()?;
+                sp.execute("INSERT INTO foo VALUES (2)", [])?;
+                // releasing a nested savepoint must not trigger a notification
+                sp.commit()?;
+            }
+            assert_eq!(0, calls.load(Ordering::SeqCst));
+            tx.commit()?;
+            assert_eq!(1, calls.load(Ordering::SeqCst));
+            assert_eq!(2, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_returning() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            db.wal_hook(Some(|_: &Wal, _| Err(wal_err("wal notification failed"))))?;
+            {
+                let mut stmt = db.prepare("INSERT INTO foo VALUES (1) RETURNING x")?;
+                let mut rows = stmt.query([])?;
+                {
+                    // a row already returned is not a successful notification
+                    let row = rows.next()?.expect("expected one row");
+                    assert_eq!(1, row.get::<_, i32>(0)?);
+                }
+                // iterating to the commit point reports the notification failure
+                let err = rows.next().unwrap_err();
+                assert_wal_err(&err, "wal notification failed");
+            }
+            // the write was committed anyway
+            assert_eq!(1, foo_count(&db)?);
+            assert!(db.is_autocommit());
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_drop_mid_iteration() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            let fail = Arc::new(AtomicBool::new(true));
+            let fail2 = Arc::clone(&fail);
+            db.wal_hook(Some(move |_: &Wal, _| {
+                if fail2.load(Ordering::SeqCst) {
+                    Err(wal_err("wal notification failed"))
+                } else {
+                    Ok(())
+                }
+            }))?;
+            {
+                let mut stmt = db.prepare("INSERT INTO foo VALUES (1), (2) RETURNING x")?;
+                let mut rows = stmt.query([])?;
+                assert!(rows.next()?.is_some());
+                // drop the iterator and statement without stepping to
+                // completion: the commit finishes during teardown, where no
+                // error can be reported to the caller
+            }
+            assert!(db.is_autocommit());
+            // nothing was stored during teardown, so once the hook succeeds
+            // again, unrelated operations see no swallowed error
+            fail.store(false, Ordering::SeqCst);
+            db.execute("INSERT INTO foo VALUES (3)", [])?;
+            assert_eq!(3, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_statement_reuse() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            let fail = Arc::new(AtomicBool::new(true));
+            let fail2 = Arc::clone(&fail);
+            db.wal_hook(Some(move |_: &Wal, _| {
+                if fail2.load(Ordering::SeqCst) {
+                    Err(wal_err("wal notification failed"))
+                } else {
+                    Ok(())
+                }
+            }))?;
+            let mut stmt = db.prepare("INSERT INTO foo VALUES (?1)")?;
+            let err = stmt.execute([1]).unwrap_err();
+            assert_wal_err(&err, "wal notification failed");
+            // the failed statement can be executed again
+            fail.store(false, Ordering::SeqCst);
+            stmt.execute([2])?;
+            drop(stmt);
+            // both writes were committed
+            assert_eq!(2, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[cfg(feature = "cache")]
+        #[test]
+        fn test_wal_hook_cached_statement() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            let fail = Arc::new(AtomicBool::new(true));
+            let fail2 = Arc::clone(&fail);
+            db.wal_hook(Some(move |_: &Wal, _| {
+                if fail2.load(Ordering::SeqCst) {
+                    Err(wal_err("wal notification failed"))
+                } else {
+                    Ok(())
+                }
+            }))?;
+            {
+                let mut stmt = db.prepare_cached("INSERT INTO foo VALUES (?1)")?;
+                let err = stmt.execute([1]).unwrap_err();
+                assert_wal_err(&err, "wal notification failed");
+                // returned to the cache while the hook still fails
+            }
+            fail.store(false, Ordering::SeqCst);
+            {
+                // the cached statement does not carry the old error
+                let mut stmt = db.prepare_cached("INSERT INTO foo VALUES (?1)")?;
+                stmt.execute([2])?;
+            }
+            assert_eq!(2, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_consecutive_errors() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls2 = Arc::clone(&calls);
+            db.wal_hook(Some(move |_: &Wal, _| {
+                let n = calls2.fetch_add(1, Ordering::SeqCst);
+                Err(if n == 0 {
+                    wal_err("first failure")
+                } else {
+                    wal_err("second failure")
+                })
+            }))?;
+            let err = db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+            assert_wal_err(&err, "first failure");
+            // the hook is still registered; each notification reports its own error
+            let err = db.execute("INSERT INTO foo VALUES (2)", []).unwrap_err();
+            assert_wal_err(&err, "second failure");
+            assert_eq!(2, calls.load(Ordering::SeqCst));
+            assert_eq!(2, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_replace_unregister_autocheckpoint() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+
+            // a replaced hook no longer runs
+            db.wal_hook(Some(|_: &Wal, _| Err(wal_err("old hook"))))?;
+            db.wal_hook(Some(|_: &Wal, _| Ok(())))?;
+            db.execute("INSERT INTO foo VALUES (1)", [])?;
+
+            // an unregistered hook no longer runs
+            db.wal_hook(Some(|_: &Wal, _| Err(wal_err("old hook"))))?;
+            db.wal_hook(None::<fn(&Wal, std::ffi::c_int) -> Result<()>>)?;
+            db.execute("INSERT INTO foo VALUES (2)", [])?;
+
+            // wal_autocheckpoint overwrites the hook registration
+            db.wal_hook(Some(|_: &Wal, _| Err(wal_err("old hook"))))?;
+            let n: i32 =
+                db.pragma_update_and_check(None, "wal_autocheckpoint", 1000, |row| row.get(0))?;
+            assert_eq!(1000, n);
+            db.execute("INSERT INTO foo VALUES (3)", [])?;
+
+            assert_eq!(3, foo_count(&db)?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_constraint_error_not_replaced() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            db.execute_batch("CREATE TABLE uniq (x INTEGER UNIQUE)")?;
+            let fail = Arc::new(AtomicBool::new(true));
+            let fail2 = Arc::clone(&fail);
+            db.wal_hook(Some(move |_: &Wal, _| {
+                if fail2.load(Ordering::SeqCst) {
+                    Err(wal_err("wal notification failed"))
+                } else {
+                    Ok(())
+                }
+            }))?;
+            let err = db.execute("INSERT INTO uniq VALUES (1)", []).unwrap_err();
+            assert_wal_err(&err, "wal notification failed");
+            fail.store(false, Ordering::SeqCst);
+            // a genuine SQL error is not replaced by an old hook error
+            let err = db.execute("INSERT INTO uniq VALUES (1)", []).unwrap_err();
+            match err {
+                Error::SqliteFailure(ref ffi_err, _) => {
+                    assert_eq!(crate::ErrorCode::ConstraintViolation, ffi_err.code);
+                }
+                other => panic!("expected SqliteFailure, got {other:?}"),
+            }
+            assert_eq!(1, db.one_column::<i32, _>("SELECT COUNT(*) FROM uniq", [])?);
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_try_commit_hook_still_rolls_back() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            let wal_calls = Arc::new(AtomicUsize::new(0));
+            let wal_calls2 = Arc::clone(&wal_calls);
+            db.wal_hook(Some(move |_: &Wal, _| {
+                wal_calls2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))?;
+            db.try_commit_hook(Some(|| Err(custom_err())))?;
+            let err = db.execute("INSERT INTO foo VALUES (1)", []).unwrap_err();
+            // the commit check reports its own error and undoes the write
+            assert_custom_err(&err);
+            assert!(db.is_autocommit());
+            assert_eq!(0, foo_count(&db)?);
+            // no commit happened, so the wal hook never ran
+            assert_eq!(0, wal_calls.load(Ordering::SeqCst));
+            Ok(())
+        }
+    }
+
+    wal_file_test! {
+        #[test]
+        fn test_wal_hook_execute_batch() -> Result<()> {
+            let (_dir, mut db) = wal_foo_db()?;
+            db.wal_hook(Some(|_: &Wal, _| Err(wal_err("wal notification failed"))))?;
+            let err = db
+                .execute_batch("INSERT INTO foo VALUES (1); INSERT INTO foo VALUES (2);")
+                .unwrap_err();
+            assert_wal_err(&err, "wal notification failed");
+            // the batch stopped at the failed notification; that statement's
+            // own transaction was already committed and stays
+            assert_eq!(1, foo_count(&db)?);
+            assert!(db.is_autocommit());
+            Ok(())
+        }
     }
 }
