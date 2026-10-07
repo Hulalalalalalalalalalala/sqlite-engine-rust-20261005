@@ -53,7 +53,7 @@
 //! }
 //! ```
 use std::any::Any;
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{CStr, c_int, c_uint, c_void};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::panic::{RefUnwindSafe, UnwindSafe, catch_unwind};
@@ -82,6 +82,61 @@ unsafe fn report_error(ctx: *mut sqlite3_context, err: &Error) {
             }
         }
     }
+}
+
+/// Name of the per-connection slot (see [`InnerConnection::set_clientdata`])
+/// holding the original error reported by the most recent failure of a
+/// scalar function registered with
+/// [`Connection::try_create_scalar_function`]. The error cannot cross the
+/// SQLite boundary itself, so the callback reports a generic SQLite error to
+/// the engine and stashes the original one here; the first rusqlite call
+/// that observes the SQLite error takes and returns the original instead.
+const SCALAR_FN_ERROR_SLOT: &CStr = c"rusqlite_scalar_function_error";
+
+/// The original error a scalar function registered with
+/// [`Connection::try_create_scalar_function`] reported most recently, waiting
+/// to be delivered to the database call that observes the failure.
+struct ScalarFnErrorState {
+    error: Option<Error>,
+}
+
+/// Stash the original error of a failing scalar function on the connection
+/// `ctx` belongs to, to be picked up by [`take_scalar_function_error`] when
+/// the database call that triggered the failure decodes SQLite's error.
+unsafe fn stash_scalar_fn_error(ctx: *mut sqlite3_context, error: Error) {
+    unsafe {
+        let db = ffi::sqlite3_context_db_handle(ctx);
+        if db.is_null() {
+            return;
+        }
+        let state = ffi::sqlite3_get_clientdata(db, SCALAR_FN_ERROR_SLOT.as_ptr())
+            .cast::<ScalarFnErrorState>();
+        if state.is_null() {
+            return;
+        }
+        (*state).error = Some(error);
+    }
+}
+
+/// If a scalar function registered with
+/// [`Connection::try_create_scalar_function`] on `db` reported an error that
+/// has not been delivered yet, take and return it. The error is consumed, so
+/// it is reported at most once, by the call that triggered the failure; a
+/// failure that is never observed (e.g., the statement is finalized during
+/// teardown) is discarded rather than attributed to a later, unrelated call.
+pub(crate) unsafe fn take_scalar_function_error(
+    db: *mut ffi::sqlite3,
+    _code: c_int,
+) -> Option<Error> {
+    if db.is_null() {
+        return None;
+    }
+    let state = unsafe { ffi::sqlite3_get_clientdata(db, SCALAR_FN_ERROR_SLOT.as_ptr()) }
+        .cast::<ScalarFnErrorState>();
+    if state.is_null() {
+        return None;
+    }
+    unsafe { (*state).error.take() }
 }
 
 /// Context is a wrapper for the SQLite function
@@ -498,6 +553,114 @@ impl Connection {
             .create_scalar_function(fn_name, n_arg, flags, x_func)
     }
 
+    /// Attach a user-defined scalar function to this database connection,
+    /// preserving the original error when the callback fails.
+    ///
+    /// This is a variant of
+    /// [`create_scalar_function`](Connection::create_scalar_function): the
+    /// function is registered under the same rules (name, number of
+    /// arguments, flags, replacement and removal via
+    /// [`remove_function`](Connection::remove_function) all behave the same,
+    /// and a registration made through one entry point replaces or removes
+    /// one made through the other), and normal return values, including
+    /// subtypes, are propagated the same way.
+    ///
+    /// The difference is in error reporting. With
+    /// [`create_scalar_function`](Connection::create_scalar_function), a
+    /// callback failure is flattened into a SQLite error and the caller only
+    /// sees [`Error::SqliteFailure`]. With this entry point, when the
+    /// callback returns `Err(e)` — or when converting the returned value to
+    /// a SQL value fails with `e` — the database call that triggered the
+    /// function (a query, an [`execute`](Connection::execute), an
+    /// [`execute_batch`](Connection::execute_batch), a row fetch, ...) fails
+    /// with `e` itself, so the caller can match on the exact [`Error`] and,
+    /// for [`Error::UserFunctionError`], recover the concrete error object
+    /// and its attached data. If the callback or the value conversion
+    /// panics, the triggering call fails with [`Error::UnwindingPanic`] and
+    /// the process keeps running.
+    ///
+    /// The error is delivered to the call that triggered the failure only:
+    /// it is reported at most once, is not leaked into unrelated statements
+    /// or other connections, and does not mask genuine SQLite errors
+    /// afterwards. A failure does not unregister the function, does not
+    /// commit or roll back any surrounding transaction, and does not prevent
+    /// the statement or the connection from being reused.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rusqlite::{Connection, Error, Result};
+    /// # use rusqlite::functions::FunctionFlags;
+    /// fn fallible_scalar_function_example(db: Connection) -> Result<()> {
+    ///     db.try_create_scalar_function(
+    ///         "halve",
+    ///         1,
+    ///         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+    ///         |ctx| {
+    ///             let value = ctx.get::<f64>(0)?;
+    ///             if value < 0f64 {
+    ///                 return Err(Error::InvalidParameter("negative value".to_owned()));
+    ///             }
+    ///             Ok(value / 2f64)
+    ///         },
+    ///     )?;
+    ///
+    ///     let six_halved: f64 = db.query_row("SELECT halve(6)", [], |r| r.get(0))?;
+    ///     assert_eq!(six_halved, 3f64);
+    ///
+    ///     let err = db
+    ///         .query_row::<f64, _, _>("SELECT halve(-6)", [], |r| r.get(0))
+    ///         .unwrap_err();
+    ///     assert!(matches!(err, Error::InvalidParameter(_)), "{err:?}");
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Failure
+    ///
+    /// Will return Err if the function could not be attached to the connection.
+    #[inline]
+    pub fn try_create_scalar_function<F, N: Name, T>(
+        &self,
+        fn_name: N,
+        n_arg: c_int,
+        flags: FunctionFlags,
+        x_func: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Context<'_>) -> Result<T> + Send + 'static,
+        T: SqlFnOutput,
+    {
+        self.db
+            .borrow_mut()
+            .try_create_scalar_function(fn_name, n_arg, flags, x_func)
+    }
+
+    /// Attach a user-defined scalar function to this database connection,
+    /// preserving the original error when the callback fails.
+    ///
+    /// This is an alias of
+    /// [`try_create_scalar_function`](Connection::try_create_scalar_function);
+    /// see its documentation for the exact semantics.
+    ///
+    /// # Failure
+    ///
+    /// Will return Err if the function could not be attached to the connection.
+    #[inline]
+    pub fn create_scalar_function_with_error<F, N: Name, T>(
+        &self,
+        fn_name: N,
+        n_arg: c_int,
+        flags: FunctionFlags,
+        x_func: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Context<'_>) -> Result<T> + Send + 'static,
+        T: SqlFnOutput,
+    {
+        self.try_create_scalar_function(fn_name, n_arg, flags, x_func)
+    }
+
     /// Attach a user-defined aggregate function to this
     /// database connection.
     ///
@@ -635,6 +798,119 @@ impl InnerConnection {
             )
         };
         self.decode_result(r)
+    }
+
+    /// ```compile_fail
+    /// use rusqlite::{functions::FunctionFlags, Connection, Result};
+    /// fn main() -> Result<()> {
+    ///     let db = Connection::open_in_memory()?;
+    ///     {
+    ///         let mut called = std::sync::atomic::AtomicBool::new(false);
+    ///         db.try_create_scalar_function(
+    ///             "test",
+    ///             0,
+    ///             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+    ///             |_| {
+    ///                 called.store(true, std::sync::atomic::Ordering::Relaxed);
+    ///                 Ok(true)
+    ///             },
+    ///         );
+    ///     }
+    ///     let result: Result<bool> = db.query_row("SELECT test()", [], |r| r.get(0));
+    ///     assert!(result?);
+    ///     Ok(())
+    /// }
+    /// ```
+    fn try_create_scalar_function<F, N: Name, T>(
+        &mut self,
+        fn_name: N,
+        n_arg: c_int,
+        flags: FunctionFlags,
+        x_func: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Context<'_>) -> Result<T> + Send + 'static,
+        T: SqlFnOutput,
+    {
+        unsafe extern "C" fn call_boxed_closure_with_error<F, T>(
+            ctx: *mut sqlite3_context,
+            argc: c_int,
+            argv: *mut *mut sqlite3_value,
+        ) where
+            F: Fn(&Context<'_>) -> Result<T>,
+            T: SqlFnOutput,
+        {
+            unsafe {
+                let args = slice::from_raw_parts(argv, argc as usize);
+                // The callback, the conversion of its return value to a SQL
+                // value and the delivery of that value are all covered: a
+                // failure of any of them reports the original error, and an
+                // unwinding panic in any of them reports
+                // `Error::UnwindingPanic`, without crossing the FFI boundary.
+                let r = catch_unwind(|| -> Result<()> {
+                    let boxed_f: *const F = ffi::sqlite3_user_data(ctx).cast::<F>();
+                    assert!(
+                        !boxed_f.is_null(),
+                        "Internal error - null function pointer"
+                    );
+                    let f_ctx = Context { ctx, args };
+                    let t = (*boxed_f)(&f_ctx)?;
+                    let (value, sub_type) = t.to_sql()?;
+                    set_result(ctx, args, value)?;
+                    if let Some(sub_type) = sub_type {
+                        ffi::sqlite3_result_subtype(ctx, sub_type);
+                    }
+                    Ok(())
+                });
+                let r = match r {
+                    Ok(r) => r,
+                    Err(_) => Err(Error::UnwindingPanic),
+                };
+                if let Err(err) = r {
+                    // Report to SQLite exactly like `create_scalar_function`
+                    // does, so the engine-level behavior (statement abort,
+                    // transaction handling, error code and message) is
+                    // unchanged, and additionally stash the original error
+                    // for the call that will observe the failure.
+                    report_error(ctx, &err);
+                    stash_scalar_fn_error(ctx, err);
+                }
+            }
+        }
+
+        self.ensure_scalar_fn_error_slot()?;
+        let boxed_f: *mut F = Box::into_raw(Box::new(x_func));
+        let c_name = fn_name.as_cstr()?;
+        let r = unsafe {
+            ffi::sqlite3_create_function_v2(
+                self.db(),
+                c_name.as_ptr(),
+                n_arg,
+                flags.bits(),
+                boxed_f.cast::<c_void>(),
+                Some(call_boxed_closure_with_error::<F, T>),
+                None,
+                None,
+                Some(free_boxed_value::<F>),
+            )
+        };
+        self.decode_result(r)
+    }
+
+    /// Create the per-connection slot used to hand the original error of a
+    /// failing `try_create_scalar_function` callback to the triggering call,
+    /// unless it already exists.
+    fn ensure_scalar_fn_error_slot(&mut self) -> Result<()> {
+        let existing =
+            unsafe { self.get_clientdata::<ScalarFnErrorState, _>(SCALAR_FN_ERROR_SLOT) }?;
+        if existing.is_null() {
+            self.set_clientdata(
+                SCALAR_FN_ERROR_SLOT,
+                Some(ScalarFnErrorState { error: None }),
+                |_, _| ffi::SQLITE_OK,
+            )?;
+        }
+        Ok(())
     }
 
     fn create_aggregate_function<A, D, N: Name, T>(
@@ -1269,5 +1545,626 @@ mod test {
         })?;
         assert_eq!(result.unwrap(), value);
         Ok(())
+    }
+
+    mod try_scalar {
+        use super::super::{FunctionFlags, SqlFnArg, SubType};
+        use crate::types::{ToSql, ToSqlOutput};
+        use crate::{Connection, Error, Result, ffi};
+        use std::fmt;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct FnError {
+            tag: u64,
+            detail: String,
+            payload: Vec<u8>,
+        }
+
+        impl fmt::Display for FnError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}: {}", self.tag, self.detail)
+            }
+        }
+
+        impl std::error::Error for FnError {}
+
+        fn fn_error(tag: u64) -> Error {
+            Error::UserFunctionError(Box::new(FnError {
+                tag,
+                detail: format!("detail/{tag}"),
+                payload: vec![0, 127, 255],
+            }))
+        }
+
+        fn assert_fn_error(err: &Error, tag: u64) {
+            match err {
+                Error::UserFunctionError(inner) => {
+                    let fe = inner
+                        .downcast_ref::<FnError>()
+                        .expect("original custom error type was lost");
+                    assert_eq!(fe.tag, tag);
+                    assert_eq!(fe.detail, format!("detail/{tag}"));
+                    assert_eq!(fe.payload, vec![0, 127, 255]);
+                }
+                other => panic!("expected the callback's error {tag}, got {other:?}"),
+            }
+        }
+
+        fn flags() -> FunctionFlags {
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC
+        }
+
+        /// A scalar function that fails with `fn_error(tag)` while `gate` is
+        /// set, and otherwise returns its argument unchanged.
+        fn gated_function(
+            db: &Connection,
+            name: &str,
+            tag: u64,
+            gate: Arc<AtomicBool>,
+        ) -> Result<()> {
+            db.try_create_scalar_function(name, 1, flags(), move |ctx| {
+                let x = ctx.get::<i64>(0)?;
+                if gate.load(Ordering::SeqCst) {
+                    return Err(fn_error(tag));
+                }
+                Ok(x)
+            })
+        }
+
+        #[test]
+        fn success_values_subtypes_and_alias() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.try_create_scalar_function(c"halve2", 1, flags(), |ctx| {
+                Ok(ctx.get::<f64>(0)? / 2f64)
+            })?;
+            assert_eq!(db.one_column::<f64, _>("SELECT halve2(6)", [])?, 3f64);
+
+            // subtypes propagate like with `create_scalar_function`
+            db.try_create_scalar_function(
+                c"try_setsubtype",
+                2,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_RESULT_SUBTYPE,
+                |ctx| {
+                    let value: SqlFnArg = ctx.get_arg(0);
+                    let sub_type: SubType = Some(ctx.get::<u32>(1)?);
+                    Ok((value, sub_type))
+                },
+            )?;
+            db.try_create_scalar_function(c"try_getsubtype", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+                Ok(ctx.get_subtype(0) as i32)
+            })?;
+            let result: i32 =
+                db.one_column("SELECT try_getsubtype(try_setsubtype('hello',123));", [])?;
+            assert_eq!(123, result);
+
+            // the alias registers the same kind of function
+            db.create_scalar_function_with_error(c"alias_fail", 0, flags(), |_| -> Result<i64> {
+                Err(fn_error(5))
+            })?;
+            assert_fn_error(&db.one_column::<i64, _>("SELECT alias_fail()", []).unwrap_err(), 5);
+            Ok(())
+        }
+
+        #[test]
+        fn original_error_object_and_data_preserved() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.try_create_scalar_function(c"fail", 0, flags(), |_| -> Result<i64> {
+                Err(fn_error(41))
+            })?;
+            assert_fn_error(
+                &db.query_row("SELECT fail()", [], |r| r.get::<_, i64>(0))
+                    .unwrap_err(),
+                41,
+            );
+            // the error was consumed: a genuine SQLite error that follows is
+            // reported as itself, not as a leftover function error
+            let err = db.prepare("SELEC 1").unwrap_err();
+            assert!(matches!(err, Error::SqlInputError { .. }), "{err:?}");
+            Ok(())
+        }
+
+        #[test]
+        fn error_variants_round_trip() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            let cases = [
+                Error::InvalidParameterName("fn-key".into()),
+                Error::IntegralValueOutOfRange(6, -9_223_372_036_854_775_807),
+                Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_BUSY), Some("original busy".into())),
+                Error::QueryReturnedNoRows,
+                Error::InvalidParameterCount(3, 5),
+                Error::SqlInputError {
+                    error: ffi::Error::new(ffi::SQLITE_ERROR),
+                    msg: "fn SQL failure".into(),
+                    sql: "fn source".into(),
+                    offset: 5,
+                },
+            ];
+            for (index, expected) in cases.into_iter().enumerate() {
+                let name = format!("variant{index}");
+                let called = Arc::new(AtomicBool::new(false));
+                let called2 = Arc::clone(&called);
+                let pending = Mutex::new(Some(expected));
+                db.try_create_scalar_function(name.as_str(), 0, flags(), move |_| {
+                    called2.store(true, Ordering::SeqCst);
+                    Err::<i64, Error>(pending
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("unexpected additional call"))
+                })?;
+                let sql = format!("SELECT {name}()");
+                let actual = db.one_column::<i64, _>(&sql, []).unwrap_err();
+                assert!(called.load(Ordering::SeqCst), "function was not called");
+                // `Error` is not `Clone`; rebuild the expectation per index
+                match index {
+                    0 => assert_eq!(actual, Error::InvalidParameterName("fn-key".into())),
+                    1 => assert_eq!(
+                        actual,
+                        Error::IntegralValueOutOfRange(6, -9_223_372_036_854_775_807)
+                    ),
+                    2 => assert_eq!(
+                        actual,
+                        Error::SqliteFailure(
+                            ffi::Error::new(ffi::SQLITE_BUSY),
+                            Some("original busy".into())
+                        )
+                    ),
+                    3 => assert_eq!(actual, Error::QueryReturnedNoRows),
+                    4 => assert_eq!(actual, Error::InvalidParameterCount(3, 5)),
+                    5 => assert_eq!(
+                        actual,
+                        Error::SqlInputError {
+                            error: ffi::Error::new(ffi::SQLITE_ERROR),
+                            msg: "fn SQL failure".into(),
+                            sql: "fn source".into(),
+                            offset: 5,
+                        }
+                    ),
+                    _ => unreachable!(),
+                }
+                // the connection is fully usable afterwards
+                assert_eq!(db.one_column::<i64, _>("SELECT 1", [])?, 1);
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn custom_error_variant_round_trip() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.try_create_scalar_function(c"custom", 0, flags(), |_| -> Result<i64> {
+                Err(Error::ToSqlConversionFailure(Box::new(FnError {
+                    tag: 43,
+                    detail: "detail/43".into(),
+                    payload: vec![9, 8, 7],
+                })))
+            })?;
+            match db.one_column::<i64, _>("SELECT custom()", []).unwrap_err() {
+                Error::ToSqlConversionFailure(inner) => {
+                    let fe = inner.downcast_ref::<FnError>().expect("custom type lost");
+                    assert_eq!(fe.tag, 43);
+                    assert_eq!(fe.payload, vec![9, 8, 7]);
+                }
+                other => panic!("expected ToSqlConversionFailure, got {other:?}"),
+            }
+            Ok(())
+        }
+
+        struct FailingToSql;
+        impl ToSql for FailingToSql {
+            fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+                Err(fn_error(77))
+            }
+        }
+
+        struct PanickingToSql;
+        impl ToSql for PanickingToSql {
+            fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+                panic!("conversion panic")
+            }
+        }
+
+        #[test]
+        fn result_conversion_error_preserved() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.try_create_scalar_function(c"bad_result", 0, flags(), |_| Ok(FailingToSql))?;
+            assert_fn_error(
+                &db.one_column::<i64, _>("SELECT bad_result()", []).unwrap_err(),
+                77,
+            );
+            assert_eq!(db.one_column::<i64, _>("SELECT 1", [])?, 1);
+            Ok(())
+        }
+
+        #[test]
+        fn panics_become_unwinding_panic_and_recover() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            let panic = Arc::new(AtomicBool::new(true));
+            let flag = Arc::clone(&panic);
+            db.try_create_scalar_function(c"maybe_panic", 1, flags(), move |ctx| {
+                if flag.load(Ordering::SeqCst) {
+                    panic!("callback panic");
+                }
+                ctx.get::<i64>(0)
+            })?;
+            assert_eq!(
+                db.one_column::<i64, _>("SELECT maybe_panic(1)", [])
+                    .unwrap_err(),
+                Error::UnwindingPanic
+            );
+            // the function is still registered: normal input succeeds again
+            panic.store(false, Ordering::SeqCst);
+            assert_eq!(db.one_column::<i64, _>("SELECT maybe_panic(2)", [])?, 2);
+
+            // a panic while converting the return value is caught too
+            db.try_create_scalar_function(c"panic_result", 0, flags(), |_| Ok(PanickingToSql))?;
+            assert_eq!(
+                db.one_column::<i64, _>("SELECT panic_result()", [])
+                    .unwrap_err(),
+                Error::UnwindingPanic
+            );
+            assert_eq!(db.one_column::<i64, _>("SELECT 1", [])?, 1);
+            Ok(())
+        }
+
+        #[test]
+        fn execute_and_batch_receive_the_error() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE t(x INTEGER)")?;
+            let gate = Arc::new(AtomicBool::new(true));
+            gated_function(&db, "gate_fail", 61, Arc::clone(&gate))?;
+
+            // execute
+            let err = db
+                .execute("INSERT INTO t VALUES (gate_fail(1))", [])
+                .unwrap_err();
+            assert_fn_error(&err, 61);
+            // no transaction is left behind in autocommit mode
+            assert!(db.is_autocommit());
+
+            // execute_batch stops at the failing statement
+            let err = db
+                .execute_batch(
+                    "INSERT INTO t VALUES (1);
+                     INSERT INTO t VALUES (gate_fail(2));
+                     INSERT INTO t VALUES (3);",
+                )
+                .unwrap_err();
+            assert_fn_error(&err, 61);
+            assert_eq!(db.one_column::<i64, _>("SELECT COUNT(*) FROM t", [])?, 1);
+            assert_eq!(db.one_column::<i64, _>("SELECT MIN(x) FROM t", [])?, 1);
+
+            // once the gate is lifted the same statements succeed
+            gate.store(false, Ordering::SeqCst);
+            db.execute("INSERT INTO t VALUES (gate_fail(2))", [])?;
+            assert_eq!(db.one_column::<i64, _>("SELECT COUNT(*) FROM t", [])?, 2);
+            Ok(())
+        }
+
+        #[test]
+        fn row_iteration_ends_at_the_failure() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2),(3);")?;
+            db.try_create_scalar_function(c"fail_on_two", 1, flags(), |ctx| {
+                let x = ctx.get::<i64>(0)?;
+                if x == 2 {
+                    return Err(fn_error(71));
+                }
+                Ok(x)
+            })?;
+            // no ORDER BY: rows are produced lazily, one per fetch
+            let mut stmt = db.prepare("SELECT fail_on_two(x) FROM t")?;
+            let mut rows = stmt.query([])?;
+            {
+                // rows delivered before the failure are unaffected
+                let row = rows.next()?.expect("first row");
+                assert_eq!(row.get::<_, i64>(0)?, 1);
+            }
+            // the failing fetch reports the original error
+            assert_fn_error(&rows.next().unwrap_err(), 71);
+            // the result set is over: further fetches report the end
+            assert!(rows.next()?.is_none());
+            drop(rows);
+            // the statement can be reused
+            assert_eq!(stmt.query_row([], |r| r.get::<_, i64>(0))?, 1);
+            Ok(())
+        }
+
+        #[test]
+        fn failure_is_delivered_exactly_once() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls2 = Arc::clone(&calls);
+            db.try_create_scalar_function(c"counted_fail", 0, flags(), move |_| {
+                let n = calls2.fetch_add(1, Ordering::SeqCst) as u64;
+                Err::<i64, Error>(fn_error(100 + n))
+            })?;
+            let e1 = db.one_column::<i64, _>("SELECT counted_fail()", []).unwrap_err();
+            let e2 = db.one_column::<i64, _>("SELECT counted_fail()", []).unwrap_err();
+            // each call gets the error of its own invocation, exactly once
+            assert_fn_error(&e1, 100);
+            assert_fn_error(&e2, 101);
+            Ok(())
+        }
+
+        #[test]
+        fn failure_inside_aggregate_query() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2),(3);")?;
+            db.try_create_scalar_function(c"agg_fail", 1, flags(), |ctx| {
+                let x = ctx.get::<i64>(0)?;
+                if x == 2 {
+                    return Err(fn_error(97));
+                }
+                Ok(x)
+            })?;
+            // the function fails while SQLite is stepping an aggregate
+            assert_fn_error(
+                &db.one_column::<i64, _>("SELECT sum(agg_fail(x)) FROM t", [])
+                    .unwrap_err(),
+                97,
+            );
+            // the connection stays usable
+            assert_eq!(db.one_column::<i64, _>("SELECT sum(x) FROM t", [])?, 6);
+            Ok(())
+        }
+
+        #[test]
+        fn returning_clause_reports_the_error() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE t(x INTEGER)")?;
+            let gate = Arc::new(AtomicBool::new(true));
+            gated_function(&db, "ret_fail", 99, Arc::clone(&gate))?;
+            let mut stmt = db.prepare("INSERT INTO t VALUES (ret_fail(1)) RETURNING x")?;
+            // the write fails while fetching the returned row
+            assert_fn_error(&stmt.query_row([], |r| r.get::<_, i64>(0)).unwrap_err(), 99);
+            drop(stmt);
+            assert_eq!(db.one_column::<i64, _>("SELECT COUNT(*) FROM t", [])?, 0);
+            // the same statement succeeds once the function recovers
+            gate.store(false, Ordering::SeqCst);
+            let mut stmt = db.prepare("INSERT INTO t VALUES (ret_fail(1)) RETURNING x")?;
+            assert_eq!(stmt.query_row([], |r| r.get::<_, i64>(0))?, 1);
+            Ok(())
+        }
+
+        #[test]
+        fn statement_reuse_and_cleanup() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            let gate = Arc::new(AtomicBool::new(true));
+            gated_function(&db, "reusable", 81, Arc::clone(&gate))?;
+
+            // same statement, rebound and re-executed
+            let mut stmt = db.prepare("SELECT reusable(?)")?;
+            assert_fn_error(&stmt.query_row([1], |r| r.get::<_, i64>(0)).unwrap_err(), 81);
+            gate.store(false, Ordering::SeqCst);
+            assert_eq!(stmt.query_row([2], |r| r.get::<_, i64>(0))?, 2);
+            drop(stmt);
+
+            // destroying the statement and running other SQL does not
+            // resurrect the delivered error
+            gate.store(true, Ordering::SeqCst);
+            {
+                let mut stmt = db.prepare("SELECT reusable(?)")?;
+                assert_fn_error(&stmt.query_row([1], |r| r.get::<_, i64>(0)).unwrap_err(), 81);
+            }
+            assert_eq!(db.one_column::<i64, _>("SELECT 5", [])?, 5);
+            gate.store(false, Ordering::SeqCst);
+            assert_eq!(db.one_column::<i64, _>("SELECT reusable(4)", [])?, 4);
+            Ok(())
+        }
+
+        #[cfg(feature = "cache")]
+        #[test]
+        fn cached_statement_does_not_carry_the_error() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            let gate = Arc::new(AtomicBool::new(true));
+            gated_function(&db, "cached_reusable", 85, Arc::clone(&gate))?;
+            {
+                let mut stmt = db.prepare_cached("SELECT cached_reusable(?)")?;
+                assert_fn_error(&stmt.query_row([1], |r| r.get::<_, i64>(0)).unwrap_err(), 85);
+                // returned to the cache while the function still fails
+            }
+            gate.store(false, Ordering::SeqCst);
+            {
+                // the cached statement does not carry the old error
+                let mut stmt = db.prepare_cached("SELECT cached_reusable(?)")?;
+                assert_eq!(stmt.query_row([3], |r| r.get::<_, i64>(0))?, 3);
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn early_drop_leaves_no_error_behind() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1),(2);")?;
+            db.try_create_scalar_function(c"would_fail", 1, flags(), |ctx| {
+                let x = ctx.get::<i64>(0)?;
+                if x == 2 {
+                    return Err(fn_error(91));
+                }
+                Ok(x)
+            })?;
+            {
+                let mut stmt = db.prepare("SELECT would_fail(x) FROM t")?;
+                let mut rows = stmt.query([])?;
+                assert!(rows.next()?.is_some());
+                // stop reading before the failing row and destroy everything
+            }
+            // no error was left behind to leak into unrelated calls
+            assert_eq!(db.one_column::<i64, _>("SELECT 1", [])?, 1);
+            let err = db.prepare("SELEC 1").unwrap_err();
+            assert!(matches!(err, Error::SqlInputError { .. }), "{err:?}");
+            Ok(())
+        }
+
+        #[test]
+        fn errors_are_isolated_between_statements_and_connections() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1);")?;
+            db.try_create_scalar_function(c"fail_a", 1, flags(), |_| -> Result<i64> {
+                Err(fn_error(201))
+            })?;
+            db.try_create_scalar_function(c"fail_b", 1, flags(), |_| -> Result<i64> {
+                Err(fn_error(202))
+            })?;
+            let mut a = db.prepare("SELECT fail_a(x) FROM t")?;
+            let mut b = db.prepare("SELECT fail_b(x) FROM t")?;
+            // alternating reads: each statement gets its own function's error
+            assert_fn_error(&a.query_row([], |r| r.get::<_, i64>(0)).unwrap_err(), 201);
+            assert_eq!(db.one_column::<i64, _>("SELECT 5", [])?, 5);
+            assert_fn_error(&b.query_row([], |r| r.get::<_, i64>(0)).unwrap_err(), 202);
+            drop(a);
+            drop(b);
+
+            // connections do not leak errors into each other
+            let db1 = Connection::open_in_memory()?;
+            let db2 = Connection::open_in_memory()?;
+            db1.try_create_scalar_function(c"f", 0, flags(), |_| -> Result<i64> {
+                Err(fn_error(301))
+            })?;
+            db2.try_create_scalar_function(c"f", 0, flags(), |_| -> Result<i64> {
+                Err(fn_error(302))
+            })?;
+            assert_fn_error(&db1.one_column::<i64, _>("SELECT f()", []).unwrap_err(), 301);
+            assert_fn_error(&db2.one_column::<i64, _>("SELECT f()", []).unwrap_err(), 302);
+            assert_fn_error(&db1.one_column::<i64, _>("SELECT f()", []).unwrap_err(), 301);
+            Ok(())
+        }
+
+        #[test]
+        fn nested_sql_through_context_connection() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.try_create_scalar_function(c"inner_fail", 0, flags(), |_| -> Result<i64> {
+                Err(fn_error(51))
+            })?;
+
+            // an inner error the callback handles does not fail the outer call
+            db.try_create_scalar_function(c"outer_handled", 0, flags(), |ctx| {
+                let conn = unsafe { ctx.get_connection()? };
+                let r: Result<i64> = conn.query_row("SELECT inner_fail()", [], |r| r.get(0));
+                assert_fn_error(&r.unwrap_err(), 51);
+                Ok(42i64)
+            })?;
+            assert_eq!(db.one_column::<i64, _>("SELECT outer_handled()", [])?, 42);
+
+            // an inner error the callback returns is delivered to the outer
+            // caller as the same error object
+            db.try_create_scalar_function(c"outer_propagated", 0, flags(), |ctx| -> Result<i64> {
+                let conn = unsafe { ctx.get_connection()? };
+                let r: Result<i64> = conn.query_row("SELECT inner_fail()", [], |r| r.get(0));
+                Err(r.unwrap_err())
+            })?;
+            assert_fn_error(
+                &db.one_column::<i64, _>("SELECT outer_propagated()", [])
+                    .unwrap_err(),
+                51,
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn unrelated_sqlite_errors_are_not_masked() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE t(x INTEGER UNIQUE); INSERT INTO t VALUES (1);")?;
+            db.try_create_scalar_function(c"always_fail", 0, flags(), |_| -> Result<i64> {
+                Err(fn_error(111))
+            })?;
+            assert_fn_error(&db.one_column::<i64, _>("SELECT always_fail()", []).unwrap_err(), 111);
+
+            // a unique-constraint violation is reported as itself
+            match db.execute("INSERT INTO t VALUES (1)", []).unwrap_err() {
+                Error::SqliteFailure(ref err, _) => {
+                    assert_eq!(crate::ErrorCode::ConstraintViolation, err.code);
+                }
+                ref other => panic!("expected SqliteFailure, got {other:?}"),
+            }
+            // a syntax error keeps its offset information
+            match db.prepare("SELEC 1").unwrap_err() {
+                Error::SqlInputError { .. } => {}
+                ref other => panic!("expected SqlInputError, got {other:?}"),
+            }
+            // and a generic SQLite error is not rewritten either
+            db.execute_batch("BEGIN")?;
+            match db.execute_batch("BEGIN").unwrap_err() {
+                Error::SqliteFailure(ref err, _) => {
+                    assert_eq!(crate::ErrorCode::Unknown, err.code);
+                }
+                ref other => panic!("expected SqliteFailure, got {other:?}"),
+            }
+            db.execute_batch("ROLLBACK")?;
+            Ok(())
+        }
+
+        #[test]
+        fn shared_registration_replace_and_remove() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            // a try_ registration replaces a legacy one with the same name
+            db.create_scalar_function(c"f", 0, flags(), |_| Ok(1i64))?;
+            db.try_create_scalar_function(c"f", 0, flags(), |_| Ok(2i64))?;
+            assert_eq!(db.one_column::<i64, _>("SELECT f()", [])?, 2);
+            // and vice versa; the legacy entry keeps its flattening behavior
+            db.create_scalar_function(c"f", 0, flags(), |_| -> Result<i64> {
+                Err(fn_error(121))
+            })?;
+            match db.one_column::<i64, _>("SELECT f()", []).unwrap_err() {
+                Error::SqliteFailure(..) => {}
+                ref other => panic!("legacy registration must keep flattening, got {other:?}"),
+            }
+            // remove_function removes a try_ registration
+            db.try_create_scalar_function(c"g", 1, flags(), |ctx| ctx.get::<i64>(0))?;
+            assert_eq!(db.one_column::<i64, _>("SELECT g(3)", [])?, 3);
+            db.remove_function(c"g", 1)?;
+            db.one_column::<i64, _>("SELECT g(3)", []).unwrap_err();
+            Ok(())
+        }
+
+        #[test]
+        fn failure_keeps_transaction_behavior() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.execute_batch("CREATE TABLE t(x INTEGER)")?;
+            let gate = Arc::new(AtomicBool::new(false));
+            gated_function(&db, "txn_fail", 131, Arc::clone(&gate))?;
+
+            db.execute_batch("BEGIN")?;
+            db.execute("INSERT INTO t VALUES (1)", [])?;
+            gate.store(true, Ordering::SeqCst);
+            assert_fn_error(
+                &db.execute("INSERT INTO t VALUES (txn_fail(2))", [])
+                    .unwrap_err(),
+                131,
+            );
+            // the caller's transaction is neither committed nor rolled back
+            assert!(!db.is_autocommit());
+            gate.store(false, Ordering::SeqCst);
+            db.execute("INSERT INTO t VALUES (txn_fail(3))", [])?;
+            db.execute_batch("COMMIT")?;
+            assert!(db.is_autocommit());
+            assert_eq!(
+                db.one_column::<String, _>(
+                    "SELECT group_concat(x) FROM (SELECT x FROM t ORDER BY x)",
+                    [],
+                )?,
+                "1,3"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn legacy_registration_behavior_is_unchanged() -> Result<()> {
+            let db = Connection::open_in_memory()?;
+            db.create_scalar_function(c"legacy_fail", 0, flags(), |_| -> Result<i64> {
+                Err(fn_error(141))
+            })?;
+            // the legacy entry point still flattens the error into a SQLite
+            // error; the original object is not delivered
+            match db.one_column::<i64, _>("SELECT legacy_fail()", []).unwrap_err() {
+                Error::SqliteFailure(_, Some(msg)) => {
+                    assert_eq!(msg, fn_error(141).to_string());
+                }
+                ref other => panic!("expected SqliteFailure, got {other:?}"),
+            }
+            Ok(())
+        }
     }
 }

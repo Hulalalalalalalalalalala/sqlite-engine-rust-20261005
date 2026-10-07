@@ -480,6 +480,13 @@ pub unsafe fn error_from_handle(db: *mut ffi::sqlite3, code: c_int) -> Error {
     if let Some(err) = unsafe { crate::hooks::take_authorizer_error(db, code) } {
         return err;
     }
+    // A scalar function registered with `try_create_scalar_function` stashed
+    // its original error on the connection; the call that triggered the
+    // function gets that error back instead of the flattened SQLite one.
+    #[cfg(feature = "functions")]
+    if let Some(err) = unsafe { crate::functions::take_scalar_function_error(db, code) } {
+        return err;
+    }
     error_from_sqlite_code(code, unsafe { error_msg(db, code) })
 }
 
