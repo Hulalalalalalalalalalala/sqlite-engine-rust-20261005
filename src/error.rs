@@ -462,6 +462,13 @@ macro_rules! err {
 
 #[cold]
 pub unsafe fn error_from_handle(db: *mut ffi::sqlite3, code: c_int) -> Error {
+    // A scalar function registered with `create_scalar_function_with_error`
+    // keeps its original error on the connection; the call that triggered
+    // the failure reports that error instead of the generic SQLite one.
+    #[cfg(feature = "functions")]
+    if let Some(err) = unsafe { crate::functions::take_scalar_function_error(db, code) } {
+        return err;
+    }
     // A commit rejected by a `try_commit_hook` carries its own reason.
     #[cfg(feature = "hooks")]
     if let Some(err) = unsafe { crate::hooks::take_try_commit_hook_error(db, code) } {
@@ -513,6 +520,13 @@ pub unsafe fn error_with_offset(db: *mut ffi::sqlite3, code: c_int, sql: &str) -
         if db.is_null() {
             error_from_sqlite_code(code, None)
         } else {
+            // A scalar function registered with
+            // `create_scalar_function_with_error` keeps its original error
+            // on the connection; report it if this failure is its.
+            #[cfg(feature = "functions")]
+            if let Some(err) = crate::functions::take_scalar_function_error(db, code) {
+                return err;
+            }
             // A `try_authorizer` rejection fails the prepare with a generic
             // `SQLITE_ERROR`; report the reason the authorizer gave.
             #[cfg(feature = "hooks")]

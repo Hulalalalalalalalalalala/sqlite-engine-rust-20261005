@@ -358,6 +358,69 @@ unsafe fn _sql_result<T: SqlFnOutput>(
     Ok(())
 }
 
+/// The original error of the most recent failing call to a scalar function
+/// registered with
+/// [`create_scalar_function_with_error`](Connection::create_scalar_function_with_error)
+/// on a connection, along with the SQLite result code the failure was
+/// reported as.
+///
+/// SQLite only carries the result code and message of a function failure
+/// back to the caller, so the original error is kept on the connection and
+/// reported to the rusqlite call that observes that result code. The slot is
+/// cleared at the start of every such function call, and the error is taken
+/// when the failure it caused is decoded, so a stale error can never be
+/// attributed to a later, unrelated failure.
+#[derive(Default)]
+struct ScalarFunctionError {
+    error: Option<(c_int, Error)>,
+}
+
+unsafe fn scalar_function_error_slot(db: *mut ffi::sqlite3) -> *mut ScalarFunctionError {
+    unsafe { ffi::sqlite3_get_clientdata(db, c"sqlite3_create_function".as_ptr()) }
+        .cast::<ScalarFunctionError>()
+}
+
+/// If `code` is the SQLite result code that the most recent failing call to
+/// a scalar function registered with `create_scalar_function_with_error` on
+/// `db` was reported as, take and return the original error. The error is
+/// consumed, so it is reported at most once, by the call that triggered the
+/// failure.
+pub(crate) unsafe fn take_scalar_function_error(
+    db: *mut ffi::sqlite3,
+    code: c_int,
+) -> Option<Error> {
+    if db.is_null() {
+        return None;
+    }
+    let slot = unsafe { scalar_function_error_slot(db) };
+    if slot.is_null() {
+        return None;
+    }
+    let error = unsafe { &mut (*slot).error };
+    if error.as_ref().is_some_and(|(c, _)| *c == code) {
+        error.take().map(|(_, err)| err)
+    } else {
+        None
+    }
+}
+
+/// Report `err` to SQLite like [`report_error`], but set the message before
+/// the code so that the code is not reset to `SQLITE_ERROR`, and return the
+/// code the failure is reported as.
+unsafe fn report_error_with_code(ctx: *mut sqlite3_context, err: &Error) -> c_int {
+    let code = match *err {
+        Error::SqliteFailure(ref err, _) => err.extended_code,
+        _ => ffi::SQLITE_CONSTRAINT_FUNCTION,
+    };
+    unsafe {
+        if let Ok(cstr) = str_to_cstring(&err.to_string()) {
+            ffi::sqlite3_result_error(ctx, cstr.as_ptr(), -1);
+        }
+        ffi::sqlite3_result_error_code(ctx, code);
+    }
+    code
+}
+
 /// Aggregate is the callback interface for user-defined
 /// aggregate function.
 ///
@@ -456,6 +519,11 @@ impl Connection {
     /// until it is explicitly removed via
     /// [`remove_function`](Connection::remove_function).
     ///
+    /// A failing callback is reported to the caller as a generic SQLite
+    /// error; use
+    /// [`create_scalar_function_with_error`](Connection::create_scalar_function_with_error)
+    /// to have the caller receive the original error instead.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -496,6 +564,76 @@ impl Connection {
         self.db
             .borrow_mut()
             .create_scalar_function(fn_name, n_arg, flags, x_func)
+    }
+
+    /// Attach a user-defined scalar function to
+    /// this database connection, preserving the original error when the
+    /// function fails.
+    ///
+    /// This behaves like
+    /// [`create_scalar_function`](Connection::create_scalar_function) — the
+    /// function is registered under `fn_name` with `n_arg` arguments and
+    /// `flags`, and it stays registered until it is replaced or removed via
+    /// [`remove_function`](Connection::remove_function) — but a failure is
+    /// reported to the caller with the original error instead of a generic
+    /// SQLite error: if the callback returns an error, or converting its
+    /// return value to a SQL value fails, the call that triggered the
+    /// function fails with that exact [`Error`], so it can be matched and
+    /// inspected (an [`Error::UserFunctionError`], for example, can be
+    /// downcast to recover the error the callback reported). If the callback
+    /// — or the conversion of its return value — panics, the triggering
+    /// call fails with [`Error::UnwindingPanic`].
+    ///
+    /// The error is reported only to the call that triggered the failure:
+    /// other statements and other connections are unaffected, the function
+    /// stays registered, and later calls behave normally.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rusqlite::{Connection, Error, Result};
+    /// # use rusqlite::functions::FunctionFlags;
+    /// fn scalar_function_with_error_example(db: &Connection) -> Result<()> {
+    ///     db.create_scalar_function_with_error(
+    ///         "parse_int",
+    ///         1,
+    ///         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+    ///         |ctx| {
+    ///             let s = ctx.get::<String>(0)?;
+    ///             s.parse::<i64>()
+    ///                 .map_err(|e| Error::UserFunctionError(Box::new(e)))
+    ///         },
+    ///     )?;
+    ///
+    ///     let err = db
+    ///         .query_row::<i64, _, _>("SELECT parse_int('nope')", [], |r| r.get(0))
+    ///         .unwrap_err();
+    ///     match err {
+    ///         Error::UserFunctionError(e) => assert!(e.is::<std::num::ParseIntError>()),
+    ///         e => panic!("unexpected error: {e}"),
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Failure
+    ///
+    /// Will return Err if the function could not be attached to the connection.
+    #[inline]
+    pub fn create_scalar_function_with_error<F, N: Name, T>(
+        &self,
+        fn_name: N,
+        n_arg: c_int,
+        flags: FunctionFlags,
+        x_func: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Context<'_>) -> Result<T> + Send + 'static,
+        T: SqlFnOutput,
+    {
+        self.db
+            .borrow_mut()
+            .create_scalar_function_with_error(fn_name, n_arg, flags, x_func)
     }
 
     /// Attach a user-defined aggregate function to this
@@ -629,6 +767,102 @@ impl InnerConnection {
                 flags.bits(),
                 boxed_f.cast::<c_void>(),
                 Some(call_boxed_closure::<F, T>),
+                None,
+                None,
+                Some(free_boxed_value::<F>),
+            )
+        };
+        self.decode_result(r)
+    }
+
+    /// ```compile_fail
+    /// use rusqlite::{functions::FunctionFlags, Connection, Result};
+    /// fn main() -> Result<()> {
+    ///     let db = Connection::open_in_memory()?;
+    ///     {
+    ///         let mut called = std::sync::atomic::AtomicBool::new(false);
+    ///         db.create_scalar_function_with_error(
+    ///             "test",
+    ///             0,
+    ///             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+    ///             |_| {
+    ///                 called.store(true, std::sync::atomic::Ordering::Relaxed);
+    ///                 Ok(true)
+    ///             },
+    ///         );
+    ///     }
+    ///     let result: Result<bool> = db.query_row("SELECT test()", [], |r| r.get(0));
+    ///     assert!(result?);
+    ///     Ok(())
+    /// }
+    /// ```
+    fn create_scalar_function_with_error<F, N: Name, T>(
+        &mut self,
+        fn_name: N,
+        n_arg: c_int,
+        flags: FunctionFlags,
+        x_func: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Context<'_>) -> Result<T> + Send + 'static,
+        T: SqlFnOutput,
+    {
+        unsafe extern "C" fn call_boxed_closure_with_error<F, T>(
+            ctx: *mut sqlite3_context,
+            argc: c_int,
+            argv: *mut *mut sqlite3_value,
+        ) where
+            F: Fn(&Context<'_>) -> Result<T>,
+            T: SqlFnOutput,
+        {
+            unsafe {
+                let args = slice::from_raw_parts(argv, argc as usize);
+                let db = ffi::sqlite3_context_db_handle(ctx);
+                // A fresh call cannot observe a previous call's error.
+                let slot = scalar_function_error_slot(db);
+                if !slot.is_null() {
+                    (*slot).error = None;
+                }
+                let r = catch_unwind(|| {
+                    let boxed_f: *const F = ffi::sqlite3_user_data(ctx).cast::<F>();
+                    assert!(!boxed_f.is_null(), "Internal error - null function pointer");
+                    let r = (*boxed_f)(&Context { ctx, args });
+                    _sql_result(ctx, args, r)
+                });
+                let r = match r {
+                    Ok(r) => r,
+                    Err(_) => Err(Error::UnwindingPanic),
+                };
+                if let Err(err) = r {
+                    let code = report_error_with_code(ctx, &err);
+                    if !slot.is_null() {
+                        (*slot).error = Some((code, err));
+                    }
+                }
+            }
+        }
+
+        // The slot the original error is reported through is shared by all
+        // such functions on this connection.
+        if unsafe { self.get_clientdata::<ScalarFunctionError, _>(c"sqlite3_create_function") }?
+            .is_null()
+        {
+            self.set_clientdata(
+                c"sqlite3_create_function",
+                Some(ScalarFunctionError::default()),
+                |_, _| ffi::SQLITE_OK,
+            )?;
+        }
+        let boxed_f: *mut F = Box::into_raw(Box::new(x_func));
+        let c_name = fn_name.as_cstr()?;
+        let r = unsafe {
+            ffi::sqlite3_create_function_v2(
+                self.db(),
+                c_name.as_ptr(),
+                n_arg,
+                flags.bits(),
+                boxed_f.cast::<c_void>(),
+                Some(call_boxed_closure_with_error::<F, T>),
                 None,
                 None,
                 Some(free_boxed_value::<F>),
@@ -1216,6 +1450,414 @@ mod test {
         );
         assert_eq!(0, db.one_column::<u32, _>("SELECT test_len(X'');", [])?);
         assert_eq!(0, db.one_column::<u32, _>("SELECT test_len(NULL);", [])?);
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct CustomError(i32);
+
+    impl std::fmt::Display for CustomError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "custom error {}", self.0)
+        }
+    }
+
+    impl std::error::Error for CustomError {}
+
+    /// `failing(x)` returns `x`, or fails with
+    /// `Error::UserFunctionError(CustomError(x))` when `x` is negative.
+    fn failing_function(db: &Connection) -> Result<()> {
+        db.create_scalar_function_with_error(
+            c"failing",
+            1,
+            FunctionFlags::SQLITE_UTF8,
+            |ctx| -> Result<i64> {
+                let x = ctx.get::<i64>(0)?;
+                if x < 0 {
+                    Err(Error::UserFunctionError(Box::new(CustomError(x as i32))))
+                } else {
+                    Ok(x)
+                }
+            },
+        )
+    }
+
+    fn assert_custom_error(err: Error, expected: i32) {
+        match err {
+            Error::UserFunctionError(e) => {
+                assert_eq!(expected, e.downcast_ref::<CustomError>().unwrap().0);
+            }
+            e => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_scalar_function_with_error() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        // normal values pass through
+        assert_eq!(3, db.one_column::<i64, _>("SELECT failing(3)", [])?);
+        // the original error object is delivered to the triggering call
+        let err = db
+            .one_column::<i64, _>("SELECT failing(-7)", [])
+            .unwrap_err();
+        assert_custom_error(err, -7);
+        // the function stays registered and recovers
+        assert_eq!(3, db.one_column::<i64, _>("SELECT failing(3)", [])?);
+        // a later failure reports its own error, not a replayed one
+        let err = db
+            .one_column::<i64, _>("SELECT failing(-2)", [])
+            .unwrap_err();
+        assert_custom_error(err, -2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_error_not_preserved_by_default() {
+        let db = Connection::open_in_memory().unwrap();
+        db.create_scalar_function(
+            c"failing",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_| -> Result<i64> { Err(Error::UserFunctionError(Box::new(CustomError(1)))) },
+        )
+        .unwrap();
+        // the classic registration keeps its behavior of a generic SQLite error
+        match db.one_column::<i64, _>("SELECT failing()", []).unwrap_err() {
+            Error::SqliteFailure(..) => {}
+            e => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_execute_and_batch() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        db.execute_batch("CREATE TABLE t(x);")?;
+        // writes report their own function error
+        let err = db
+            .execute("INSERT INTO t VALUES (failing(-1))", [])
+            .unwrap_err();
+        assert_custom_error(err, -1);
+        // so does batch execution
+        let err = db
+            .execute_batch("INSERT INTO t VALUES (failing(-2));")
+            .unwrap_err();
+        assert_custom_error(err, -2);
+        // nothing was inserted
+        assert_eq!(0, db.one_column::<i64, _>("SELECT COUNT(*) FROM t", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_rows() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        db.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(-1),(3);")?;
+        let mut stmt = db.prepare("SELECT failing(x) FROM t")?;
+        let mut rows = stmt.query([])?;
+        // rows delivered before the failure are unaffected
+        assert_eq!(1, rows.next()?.unwrap().get::<_, i64>(0)?);
+        assert_eq!(2, rows.next()?.unwrap().get::<_, i64>(0)?);
+        // the failing read reports the original error
+        assert_custom_error(rows.next().unwrap_err(), -1);
+        // the result set is over
+        assert!(rows.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_early_drop() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        db.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1),(-1);")?;
+        {
+            let mut stmt = db.prepare("SELECT failing(x) FROM t")?;
+            let mut rows = stmt.query([])?;
+            assert_eq!(1, rows.next()?.unwrap().get::<_, i64>(0)?);
+            // drop the result set before reaching the failing row
+        }
+        // nothing leaks into later, unrelated calls
+        assert_eq!(42, db.one_column::<i64, _>("SELECT 42", [])?);
+        db.execute("INSERT INTO t VALUES (2)", [])?;
+        // and the failing row still fails with its own error when re-read
+        let mut stmt = db.prepare("SELECT failing(x) FROM t ORDER BY x")?;
+        let mut rows = stmt.query([])?;
+        assert_custom_error(rows.next().unwrap_err(), -1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_interleaved_statements() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        db.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1),(-1),(2);")?;
+        let mut s1 = db.prepare("SELECT failing(x) FROM t")?;
+        let mut s2 = db.prepare("SELECT x * 10 FROM t")?;
+        let mut r1 = s1.query([])?;
+        let mut r2 = s2.query([])?;
+        assert_eq!(1, r1.next()?.unwrap().get::<_, i64>(0)?);
+        assert_eq!(10, r2.next()?.unwrap().get::<_, i64>(0)?);
+        // the error is reported to the statement that triggered it only
+        assert_custom_error(r1.next().unwrap_err(), -1);
+        assert_eq!(-10, r2.next()?.unwrap().get::<_, i64>(0)?);
+        assert_eq!(20, r2.next()?.unwrap().get::<_, i64>(0)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_two_connections() -> Result<()> {
+        let db1 = Connection::open_in_memory()?;
+        let db2 = Connection::open_in_memory()?;
+        failing_function(&db1)?;
+        failing_function(&db2)?;
+        assert_custom_error(
+            db1.one_column::<i64, _>("SELECT failing(-1)", [])
+                .unwrap_err(),
+            -1,
+        );
+        // the other connection is unaffected
+        assert_eq!(3, db2.one_column::<i64, _>("SELECT failing(3)", [])?);
+        assert_custom_error(
+            db2.one_column::<i64, _>("SELECT failing(-2)", [])
+                .unwrap_err(),
+            -2,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_then_sqlite_error() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        db.execute_batch("CREATE TABLE u(x UNIQUE); INSERT INTO u VALUES (1);")?;
+        // trigger and deliver a function error
+        assert_custom_error(
+            db.one_column::<i64, _>("SELECT failing(-1)", [])
+                .unwrap_err(),
+            -1,
+        );
+        // a genuine constraint violation keeps its own error
+        match db.execute("INSERT INTO u VALUES (1)", []).unwrap_err() {
+            Error::SqliteFailure(e, _) => {
+                assert_eq!(e.code, crate::ffi::ErrorCode::ConstraintViolation);
+            }
+            e => panic!("unexpected error: {e}"),
+        }
+        // so does a syntax error
+        match db.prepare("SELEC oops").unwrap_err() {
+            Error::SqlInputError { .. } | Error::SqliteFailure(..) => {}
+            e => panic!("unexpected error: {e}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_reexecute() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        let mut stmt = db.prepare("SELECT failing(?)")?;
+        // fail, then rebind and succeed on the same statement
+        assert_custom_error(
+            stmt.query_one([-1], |r| r.get::<_, i64>(0)).unwrap_err(),
+            -1,
+        );
+        assert_eq!(2, stmt.query_one([2], |r| r.get::<_, i64>(0))?);
+        // a new failure reports a fresh error, not the delivered one
+        assert_custom_error(
+            stmt.query_one([-5], |r| r.get::<_, i64>(0)).unwrap_err(),
+            -5,
+        );
+        assert_eq!(7, stmt.query_one([7], |r| r.get::<_, i64>(0))?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cache")]
+    fn test_scalar_function_with_error_cached_statement() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        for i in 1..=2 {
+            let mut stmt = db.prepare_cached("SELECT failing(?)")?;
+            // each execution of the cached statement reports its own error
+            assert_custom_error(
+                stmt.query_one([-i], |r| r.get::<_, i64>(0)).unwrap_err(),
+                -i,
+            );
+            assert_eq!(i64::from(i), stmt.query_one([i], |r| r.get::<_, i64>(0))?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_panic() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.create_scalar_function_with_error(
+            c"panics",
+            1,
+            FunctionFlags::SQLITE_UTF8,
+            |ctx| -> Result<i64> {
+                let x = ctx.get::<i64>(0)?;
+                assert!(x >= 0, "boom");
+                Ok(x)
+            },
+        )?;
+        assert_eq!(
+            Error::UnwindingPanic,
+            db.one_column::<i64, _>("SELECT panics(-1)", [])
+                .unwrap_err()
+        );
+        // the process is still alive and the function still works
+        assert_eq!(3, db.one_column::<i64, _>("SELECT panics(3)", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_output_conversion() -> Result<()> {
+        use crate::types::{ToSql, ToSqlOutput};
+
+        struct Failing;
+        impl ToSql for Failing {
+            fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+                Err(Error::ToSqlConversionFailure(Box::new(CustomError(9))))
+            }
+        }
+        struct Panicking;
+        impl ToSql for Panicking {
+            fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+                panic!("boom")
+            }
+        }
+        let db = Connection::open_in_memory()?;
+        db.create_scalar_function_with_error(c"fails", 0, FunctionFlags::SQLITE_UTF8, |_| {
+            Ok(Failing)
+        })?;
+        db.create_scalar_function_with_error(c"panics", 0, FunctionFlags::SQLITE_UTF8, |_| {
+            Ok(Panicking)
+        })?;
+        // a conversion failure reports the original error
+        match db.one_column::<i64, _>("SELECT fails()", []).unwrap_err() {
+            Error::ToSqlConversionFailure(e) => {
+                assert_eq!(9, e.downcast_ref::<CustomError>().unwrap().0);
+            }
+            e => panic!("unexpected error: {e}"),
+        }
+        // a panicking conversion reports Error::UnwindingPanic
+        assert_eq!(
+            Error::UnwindingPanic,
+            db.one_column::<i64, _>("SELECT panics()", []).unwrap_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_subtype() -> Result<()> {
+        fn getsubtype(ctx: &Context<'_>) -> Result<i32> {
+            Ok(ctx.get_subtype(0) as i32)
+        }
+        fn setsubtype(ctx: &Context<'_>) -> Result<(SqlFnArg, SubType)> {
+            use std::ffi::c_uint;
+            let value = ctx.get_arg(0);
+            let sub_type = ctx.get::<c_uint>(1)?;
+            Ok((value, Some(sub_type)))
+        }
+        let db = Connection::open_in_memory()?;
+        db.create_scalar_function(c"getsubtype", 1, FunctionFlags::SQLITE_UTF8, getsubtype)?;
+        db.create_scalar_function_with_error(
+            c"setsubtype",
+            2,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_RESULT_SUBTYPE,
+            setsubtype,
+        )?;
+        // normal return values and subtypes pass through
+        assert_eq!(
+            123,
+            db.one_column::<i32, _>("SELECT getsubtype(setsubtype('hello', 123))", [])?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_inner_sql() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE u(x UNIQUE); INSERT INTO u VALUES (1);")?;
+        // an inner error handled by the callback does not affect the outer call
+        db.create_scalar_function_with_error(
+            c"inner_handled",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |ctx| {
+                let conn = unsafe { ctx.get_connection()? };
+                match conn.execute("INSERT INTO u VALUES (1)", []) {
+                    Err(Error::SqliteFailure(..)) => Ok(42i64),
+                    r => panic!("unexpected result: {r:?}"),
+                }
+            },
+        )?;
+        assert_eq!(42, db.one_column::<i64, _>("SELECT inner_handled()", [])?);
+        // an inner error returned by the callback is delivered as-is
+        db.create_scalar_function_with_error(
+            c"inner_propagated",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |ctx| {
+                let conn = unsafe { ctx.get_connection()? };
+                conn.execute("INSERT INTO u VALUES (1)", [])?;
+                Ok(0i64)
+            },
+        )?;
+        match db
+            .one_column::<i64, _>("SELECT inner_propagated()", [])
+            .unwrap_err()
+        {
+            Error::SqliteFailure(e, m) => {
+                assert_eq!(e.code, crate::ffi::ErrorCode::ConstraintViolation);
+                assert_eq!(m.as_deref(), Some("UNIQUE constraint failed: u.x"));
+            }
+            e => panic!("unexpected error: {e}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_transaction() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        failing_function(&db)?;
+        db.execute_batch("CREATE TABLE t(x);")?;
+        db.execute_batch("BEGIN")?;
+        db.execute("INSERT INTO t VALUES (1)", [])?;
+        // a function failure neither commits nor rolls back the transaction
+        assert_custom_error(
+            db.execute("INSERT INTO t VALUES (failing(-1))", [])
+                .unwrap_err(),
+            -1,
+        );
+        assert!(!db.is_autocommit());
+        db.execute("INSERT INTO t VALUES (2)", [])?;
+        db.execute_batch("COMMIT")?;
+        assert_eq!(2, db.one_column::<i64, _>("SELECT COUNT(*) FROM t", [])?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_function_with_error_replace_and_remove() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.create_scalar_function_with_error(c"f", 0, FunctionFlags::SQLITE_UTF8, |_| Ok(1i64))?;
+        assert_eq!(1, db.one_column::<i64, _>("SELECT f()", [])?);
+        // replacing with a failing variant works
+        db.create_scalar_function_with_error(
+            c"f",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_| -> Result<i64> { Err(Error::UserFunctionError(Box::new(CustomError(1)))) },
+        )?;
+        assert_custom_error(db.one_column::<i64, _>("SELECT f()", []).unwrap_err(), 1);
+        // replacing with the classic registration works
+        db.create_scalar_function(c"f", 0, FunctionFlags::SQLITE_UTF8, |_| Ok(2i64))?;
+        assert_eq!(2, db.one_column::<i64, _>("SELECT f()", [])?);
+        // removing works
+        db.remove_function(c"f", 0)?;
+        db.one_column::<i64, _>("SELECT f()", []).unwrap_err();
         Ok(())
     }
 
